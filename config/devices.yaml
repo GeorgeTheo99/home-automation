@@ -1,0 +1,13 @@
+# Example devices. Discovery will add placeholders if empty.
+- id: living-room
+  name: Living Room Light
+  type: light
+  capabilities: ["on", "brightness", "color"]
+- id: kitchen
+  name: Kitchen Light
+  type: light
+  capabilities: ["on", "brightness"]
+- id: speaker-1
+  name: Living Room Speaker
+  type: speaker
+  capabilities: [play, pause, volume]

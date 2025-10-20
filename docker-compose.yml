@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    network_mode: host
+    environment:
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./ha-config:/config
+    restart: unless-stopped
+
+  # Optional: MQTT broker (enable with profile "mqtt")
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: mqtt
+    profiles: ["mqtt"]
+    ports:
+      - "1883:1883"
+    restart: unless-stopped
+
+  # Optional: Spotify Connect endpoint (enable with profile "audio")
+  # For audio output from the server itself, you may need PulseAudio/ALSA access.
+  # Uncomment appropriate device/volume mappings below for your setup.
+  librespot:
+    image: ghcr.io/librespot-org/librespot:latest
+    container_name: librespot
+    profiles: ["audio"]
+    network_mode: host
+    environment:
+      - DEVICE_NAME=${LIBRESPOT_DEVICE_NAME:-HomeServer}
+      - BITRATE=${LIBRESPOT_BITRATE:-320}
+      # PulseAudio example (uncomment and adjust UID/GID):
+      # - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    # devices:
+    #   - "/dev/snd:/dev/snd"  # ALSA access (if using ALSA output)
+    # volumes:
+    #   - "/run/user/1000/pulse:/run/user/1000/pulse" # PulseAudio socket for UID 1000
+    command: ["--name", "${LIBRESPOT_DEVICE_NAME:-HomeServer}", "--backend", "alsa"]
+    restart: unless-stopped

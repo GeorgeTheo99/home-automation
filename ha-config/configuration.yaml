@@ -1,0 +1,24 @@
+
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Core settings
+homeassistant:
+  time_zone: America/New_York
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# Reduce log noise; suppress Bluetooth scanner errors
+logger:
+  default: warning
+  logs:
+    habluetooth.scanner: critical
+    homeassistant.components.bluetooth: critical
+    custom_components.wyzeapi: debug
+    wyzeapy: debug

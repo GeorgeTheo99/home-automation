@@ -1,0 +1,17 @@
+# Environment config
+.env
+.env.*
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Home Assistant runtime data (generated inside container)
+ha-config/.storage/
+ha-config/.cloud/
+ha-config/deps/
+ha-config/home-assistant.log*
+ha-config/home-assistant_v2.db*
+ha-config/.HA_VERSION
+ha-config/.ha_run.lock
+ha-config/tts/

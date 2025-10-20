@@ -1,0 +1,10 @@
+# Example scene
+- id: cozy_evening
+  name: Cozy Evening
+  lights:
+    living-room:
+      on: true
+      brightness: 30
+      color: warm
+    kitchen:
+      on: false

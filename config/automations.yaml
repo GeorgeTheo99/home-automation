@@ -1,0 +1,6 @@
+# Example automation (stub)
+- id: evening_scene
+  when:
+    schedule: "0 19 * * *" # 7:00 PM daily
+  do:
+    scene: cozy_evening
