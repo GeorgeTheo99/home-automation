@@ -143,6 +143,26 @@ journalctl --user -u ha-voice-gateway -f
 - Local speak-back uses `espeak-ng` by default. You can adjust voice/rate via `.env`.
 - GPT NLU gets a JSON array of valid entities (friendly names, room/area, aliases) extracted from HA at startup. Keep entity names in HA up to date for best results.
 
+## Realtime Mode (Experimental)
+- Set `REALTIME_ENABLED=true` in `.env` to use OpenAI’s realtime WebSocket API instead of Whisper+chat.
+- Requires access to a realtime-capable model (e.g., `gpt-4o-realtime-preview`). Configure:
+  - `REALTIME_MODEL`, `REALTIME_MODALITIES` (`text` or `text,audio`), `REALTIME_VOICE`, `REALTIME_TEMPERATURE`.
+  - `REALTIME_MAX_AUDIO_SECS` limits how much post-wake audio is sent.
+  - `REALTIME_SESSION_TIMEOUT` aborts slow sessions; the pipeline falls back to Whisper + GPT on failure.
+- Current OpenAI policy requires `temperature >= 0.6`; the code clamps lower values automatically, but set it to ~0.7 for best results.
+- The gateway defines a `call_home_assistant` tool. GPT streams a tool call, we execute it via HA REST, and send a tool result back so the model can confirm.
+- If GPT returns audio (`modalities` includes `audio`), the PCM stream is decoded and played locally; otherwise we still use local `speak()`.
+- Troubleshooting:
+  - Check logs for `Realtime session error` messages.
+  - Some events/field names may evolve; adjust in `realtime.py` if OpenAI changes their schema.
+  - The fallback path (Whisper + GPT) keeps working even if realtime fails.
+
+### Latency Tips
+- Shorten `POST_WAKE_RECORD_SECS` and `REALTIME_MAX_AUDIO_SECS` (e.g., 1.5–2.0 seconds) to ship less audio.
+- For realtime sessions, keep `REALTIME_MODALITIES` to `text` if you don’t need voice replies.
+- If you stick with the classic pipeline, switch `MODEL_NAME` to `gpt-4o-mini` or enable fast-paths (`NLU_MODE=fast_first`) so simple light commands avoid GPT entirely.
+- Local STT (`faster-whisper`) can still be enabled later if you need a fully offline path.
+
 ### NLU Modes
 - `fast_only`: Only use local regex fast-paths (on/off, brightness %, simple colors) with HA entity aliasing from friendly names.
 - `fast_first`: Try fast-paths, fall back to GPT JSON if no match. (default)
@@ -158,6 +178,7 @@ journalctl --user -u ha-voice-gateway -f
 - If RMS is low and scores stay tiny, increase `INPUT_GAIN` (e.g., 2.0–6.0). Keep RMS generally below ~0.3 to avoid heavy clipping.
 - Avoid double triggers: increase `WAKE_COOLDOWN_SEC` (e.g., >= `POST_WAKE_RECORD_SECS + 0.5`) and/or require a short streak with `WAKE_STREAK=2`.
 - Add hysteresis: `WAKE_HYSTERESIS_SEC` adds extra guard time after cooldown to ignore trailing echoes/background voice.
+- Capture the very start of speech: `PRE_WAKE_BUFFER_SEC` keeps ~0.5–0.8 s of audio before the wake hit so the first words (“turn on…”) aren’t clipped.
 
 ## Remove old Whisper cache (manual)
 If present, remove the legacy cache directory used for offline STT:

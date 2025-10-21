@@ -1,9 +1,11 @@
+import asyncio
 import io
 import json
 import os
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -11,6 +13,8 @@ import sounddevice as sd
 from dotenv import load_dotenv
 from openai import OpenAI
 from openwakeword import Model as OWWModel
+
+import realtime
 
 
 # ----------------- Config -----------------
@@ -40,10 +44,23 @@ WAKE_HYSTERESIS_SEC = float(os.getenv("WAKE_HYSTERESIS_SEC", "0.8"))
 NLU_MODE = os.getenv("NLU_MODE", "fast_first").lower()  # fast_only | fast_first | gpt_only
 LOG_NLU = os.getenv("LOG_NLU", "true").lower() == "true"
 
+REALTIME_ENABLED = os.getenv("REALTIME_ENABLED", "false").lower() == "true"
+REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
+REALTIME_MODALITIES = [m.strip() for m in os.getenv("REALTIME_MODALITIES", "text").split(",") if m.strip()]
+if not REALTIME_MODALITIES:
+    REALTIME_MODALITIES = ["text"]
+REALTIME_VOICE = os.getenv("REALTIME_VOICE", "verse").strip() or None
+REALTIME_SESSION_TIMEOUT = float(os.getenv("REALTIME_SESSION_TIMEOUT", "12.0"))
+REALTIME_MAX_AUDIO_SECS = float(os.getenv("REALTIME_MAX_AUDIO_SECS", "4.0"))
+REALTIME_TEMPERATURE = float(os.getenv("REALTIME_TEMPERATURE", "0.0"))
+REALTIME_EXPECT_AUDIO = any(m.lower() == "audio" for m in REALTIME_MODALITIES)
+REALTIME_STREAM_SAMPLE_RATE = int(os.getenv("REALTIME_STREAM_SAMPLE_RATE", "24000"))
+
 SAMPLE_RATE = 16000
 CHANNELS = 1
 WAKE_BLOCK_SEC = float(os.getenv("WAKE_BLOCK_SEC", "0.5"))
 STREAM_BLOCK_SEC = float(os.getenv("STREAM_BLOCK_SEC", "0.2"))
+PRE_WAKE_BUFFER_SEC = float(os.getenv("PRE_WAKE_BUFFER_SEC", "0.6"))
 
 
 def log(level: str, *args):
@@ -318,6 +335,10 @@ import subprocess
 
 
 def _friendly(entity_id: str) -> str:
+    if isinstance(entity_id, (list, tuple)):
+        names = [_friendly(e) for e in entity_id if isinstance(e, str)]
+        names = [n for n in names if n]
+        return ", ".join(names)
     if entity_id in ENT_FRIENDLY:
         return ENT_FRIENDLY[entity_id]
     try:
@@ -493,6 +514,9 @@ def main():
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16", device=device_index, blocksize=stream_block) as stream:
         streak = 0
         hysteresis_until = 0.0
+        pre_buffer: Deque[np.ndarray] = deque()
+        pre_buffer_samples = 0
+        pre_buffer_max = max(int(PRE_WAKE_BUFFER_SEC * SAMPLE_RATE), 0)
         while True:
             # Read a short chunk continuously
             frames, overflowed = stream.read(stream_block)
@@ -500,6 +524,15 @@ def main():
             samples_f32 = samples_i16.astype(np.float32) / 32768.0
             if INPUT_GAIN != 1.0:
                 samples_f32 = np.clip(samples_f32 * INPUT_GAIN, -1.0, 1.0)
+
+            # Maintain pre-wake buffer
+            if pre_buffer_max > 0:
+                copy_arr = samples_i16.copy()
+                pre_buffer.append(copy_arr)
+                pre_buffer_samples += len(copy_arr)
+                while pre_buffer_samples > pre_buffer_max and pre_buffer:
+                    removed = pre_buffer.popleft()
+                    pre_buffer_samples -= len(removed)
 
             now = time.monotonic()
             if now < MUTE_UNTIL or now < hysteresis_until:
@@ -537,7 +570,58 @@ def main():
                     f2, _ = stream.read(n)
                     collected.append(np.asarray(f2).flatten())
                     remaining -= n
-                pcm16 = np.concatenate(collected).astype(np.int16)
+                pre_audio = np.concatenate(list(pre_buffer)) if pre_buffer_samples and pre_buffer else np.empty((0,), dtype=np.int16)
+                chunks: List[np.ndarray] = []
+                if pre_audio.size:
+                    chunks.append(pre_audio.astype(np.int16))
+                for arr in collected:
+                    arr = arr.astype(np.int16, copy=False)
+                    if arr.size:
+                        chunks.append(arr)
+                if chunks:
+                    pcm16 = np.concatenate(chunks)
+                else:
+                    pcm16 = np.empty((0,), dtype=np.int16)
+                pre_buffer.clear()
+                pre_buffer_samples = 0
+
+                handled_realtime = False
+                if REALTIME_ENABLED:
+                    total_samples = int(pcm16.size)
+                    if total_samples < int(0.1 * SAMPLE_RATE):
+                        log("DEBUG", f"Realtime skipped: audio {total_samples} samples (<100ms)")
+                    else:
+                        try:
+                            rt_config = realtime.RealtimeConfig(
+                                api_key=OPENAI_API_KEY,
+                                model=REALTIME_MODEL,
+                                modalities=REALTIME_MODALITIES,
+                                voice=REALTIME_VOICE if REALTIME_EXPECT_AUDIO else None,
+                                temperature=max(0.6, REALTIME_TEMPERATURE),
+                                session_timeout=REALTIME_SESSION_TIMEOUT,
+                                max_audio_secs=REALTIME_MAX_AUDIO_SECS,
+                                send_audio=True,
+                                expect_audio_output=REALTIME_EXPECT_AUDIO,
+                                input_sample_rate=SAMPLE_RATE,
+                                stream_sample_rate=REALTIME_STREAM_SAMPLE_RATE,
+                            )
+
+                            handled_realtime = asyncio.run(
+                                realtime.run_realtime_session(
+                                    pcm16,
+                                    rt_config,
+                                    NLU_ENTITY_CONTEXT,
+                                    SYSTEM_PROMPT_BASE,
+                                    ha_call,
+                                    confirm_message,
+                                    speak if SPEAK_ENABLED else (lambda _: None),
+                                    log,
+                                )
+                            )
+                        except Exception as ex:
+                            log("ERROR", f"Realtime session failed: {ex}")
+                if handled_realtime:
+                    continue
 
                 log("INFO", "Transcribing…")
                 try:
