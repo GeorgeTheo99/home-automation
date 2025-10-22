@@ -136,26 +136,39 @@ journalctl --user -u ha-voice-gateway -f
 
 ## Notes
 - This gateway avoids HA’s Assist/Wyoming UI entirely.
-- STT uses OpenAI Whisper API; no local model cache required.
+- STT uses OpenAI's `gpt-4o-mini-transcribe` API (successor to Whisper); no local model cache required.
 - NLU uses `MODEL_NAME` (default: `gpt-5`). If unavailable, set to `gpt-4o-mini` or `gpt-4.1`.
   - Some models enforce default temperature; set `NLU_TEMPERATURE=1.0` (default) or let the app auto-retry without temperature.
+- The realtime path falls back to the classic Whisper+GPT pipeline only when you explicitly set `LEGACY_PIPELINE_ENABLED=true`.
 - The gateway allow‑lists HA services for safety (lights/switches by default).
 - Local speak-back uses `espeak-ng` by default. You can adjust voice/rate via `.env`.
 - GPT NLU gets a JSON array of valid entities (friendly names, room/area, aliases) extracted from HA at startup. Keep entity names in HA up to date for best results.
 
 ## Realtime Mode (Experimental)
 - Set `REALTIME_ENABLED=true` in `.env` to use OpenAI’s realtime WebSocket API instead of Whisper+chat.
-- Requires access to a realtime-capable model (e.g., `gpt-4o-realtime-preview`). Configure:
-  - `REALTIME_MODEL`, `REALTIME_MODALITIES` (`text` or `text,audio`), `REALTIME_VOICE`, `REALTIME_TEMPERATURE`.
+- Requires access to a realtime-capable model (e.g., `gpt-realtime-preview`). Configure:
+  - Existing configs that still list the deprecated `gpt-voice-40` will be remapped automatically to `gpt-realtime-preview`.
+  - `REALTIME_MODEL`, `REALTIME_MODALITIES` (`audio,text` for voiced replies), `REALTIME_VOICE`, `REALTIME_TEMPERATURE`.
   - `REALTIME_MAX_AUDIO_SECS` limits how much post-wake audio is sent.
   - `REALTIME_SESSION_TIMEOUT` aborts slow sessions; the pipeline falls back to Whisper + GPT on failure.
+  - `REALTIME_PLAYBACK_GUARD_SEC` adds padding to the mic mute window while GPT audio is playing.
+  - When server VAD is enabled we now allow short (~600 ms) follow-ups; raise or lower `REALTIME_MIN_INPUT_AUDIO_MS` (default 900 ms) to require more audio before committing.
+- Server-side VAD is enabled by default (`REALTIME_SERVER_VAD=true`). Tune detection via `REALTIME_VAD_THRESHOLD`, `REALTIME_VAD_SILENCE_MS` (default 350 ms), `REALTIME_VAD_PREFIX_MS`, and optional `REALTIME_VAD_IDLE_TIMEOUT_MS`.
+- `REALTIME_PREFETCH_SEC` (default 0.35 s) captures a short lead-in while the realtime session negotiates. `REALTIME_MIN_INPUT_AUDIO_MS` gates the minimum capture length (default 900 ms with server VAD, otherwise at least `POST_WAKE_RECORD_SECS`).
 - Current OpenAI policy requires `temperature >= 0.6`; the code clamps lower values automatically, but set it to ~0.7 for best results.
+- `REALTIME_FORCE_CREATE_RESPONSE` (default `true`) nudges the model with a manual `response.create` if it stays silent; tune `REALTIME_FORCE_RESPONSE_DELAY_MS` (ms) to wait longer before issuing the nudge.
+- Local fallbacks stay silent unless you opt in. Set `REALTIME_FALLBACK_NO_SPEECH` or `REALTIME_FALLBACK_NO_RESPONSE` if you want the gateway to apologize when realtime can’t understand or respond.
+- `FOLLOWUP_ENABLED` (default `true`) opens a follow-up window after each assistant reply so you can keep talking without repeating the wake word. Adjust `FOLLOWUP_WINDOW_SEC` (default 5 s), `FOLLOWUP_MIN_RMS`, `FOLLOWUP_MIN_PEAK`, `FOLLOWUP_TRIGGER_BLOCKS`, `FOLLOWUP_MIN_ACTIVE_MS`, `FOLLOWUP_SILENCE_SEC`, and `FOLLOWUP_MAX_CAPTURE_SEC` if you need a longer (or stricter) conversational tail.
 - The gateway defines a `call_home_assistant` tool. GPT streams a tool call, we execute it via HA REST, and send a tool result back so the model can confirm.
-- If GPT returns audio (`modalities` includes `audio`), the PCM stream is decoded and played locally; otherwise we still use local `speak()`.
+- Actions detected via the tool call trigger a local chime instead of GPT speech. Configure the file/tone via `ACTION_CHIME_*`, or set `ACTION_CHIME_ENABLED=false` to fall back to TTS confirmations.
+- Informational answers stream GPT audio (`REALTIME_MODALITIES` includes `audio`). If no audio arrives, the gateway falls back to local `speak()`.
 - Troubleshooting:
   - Check logs for `Realtime session error` messages.
   - Some events/field names may evolve; adjust in `realtime.py` if OpenAI changes their schema.
-  - The fallback path (Whisper + GPT) keeps working even if realtime fails.
+- Tweak `REALTIME_NOISE_PEAK` if quiet speech is being discarded or background hum still produces prompts.
+- The fallback path (Whisper + GPT) runs only if `LEGACY_PIPELINE_ENABLED=true`. If you want that behavior, opt in explicitly.
+- For faster wake-word rearm in realtime mode, lower `WAKE_COOLDOWN_SEC` (e.g. `0.4–0.6`) and adjust `WAKE_RETRIGGER_SUPPRESS_SEC` (default `0.6`) to balance latency vs. false re-triggers.
+- Realtime responses are forced to English; when only noise is captured (peak below `REALTIME_NOISE_PEAK` with no transcript), the session is dropped politely.
 
 ### Latency Tips
 - Shorten `POST_WAKE_RECORD_SECS` and `REALTIME_MAX_AUDIO_SECS` (e.g., 1.5–2.0 seconds) to ship less audio.
@@ -178,6 +191,9 @@ journalctl --user -u ha-voice-gateway -f
 - If RMS is low and scores stay tiny, increase `INPUT_GAIN` (e.g., 2.0–6.0). Keep RMS generally below ~0.3 to avoid heavy clipping.
 - Avoid double triggers: increase `WAKE_COOLDOWN_SEC` (e.g., >= `POST_WAKE_RECORD_SECS + 0.5`) and/or require a short streak with `WAKE_STREAK=2`.
 - Add hysteresis: `WAKE_HYSTERESIS_SEC` adds extra guard time after cooldown to ignore trailing echoes/background voice.
+- Fine-tune streak logic: `WAKE_STREAK_WINDOW_SEC` keeps the detection burst tight while `WAKE_FINAL_THRESHOLD` asks for a stronger final score.
+- Post-command mute: bump `POST_COMMAND_MUTE_SEC` to keep the mic ignored briefly after HA/GPT responses.
+- Clamp noisy playback: `WAKE_RMS_DECAY`, `WAKE_RMS_CLAMP_RATIO`, `WAKE_RMS_CLAMP_ABS`, and `WAKE_NOISE_HOLD_SEC` hold the detector while room audio is loud.
 - Capture the very start of speech: `PRE_WAKE_BUFFER_SEC` keeps ~0.5–0.8 s of audio before the wake hit so the first words (“turn on…”) aren’t clipped.
 
 ## Remove old Whisper cache (manual)
