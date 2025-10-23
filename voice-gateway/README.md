@@ -72,6 +72,17 @@ PY
 
 If you prefer ALSA‑only (no PipeWire), use `alsamixer -c 0` to enable/unmute Capture and `arecord -D default` to test.
 
+### Silent Input Troubleshooting
+- If logs show `Mic peak=0 rms=0.0000` constantly, your default source may not be set.
+  - Run `wpctl status`, note the Sources section, then set a default: `wpctl set-default <source-id>`.
+  - If using AUX/line-in, ensure the input port is selected: `wpctl set-port <source-id> analog-input-linein` (or `analog-input-internal-mic`).
+- You can let the gateway perform these at startup by setting envs in `voice-gateway/.env`:
+  - `WPCTL_SOURCE_ID=47` and `WPCTL_SET_DEFAULT=true`
+  - `WPCTL_SET_PORT=analog-input-linein`
+- As an alternative, explicitly pin a device in `.env` without changing system defaults:
+  - `MIC_DEVICE_INDEX=<index>` or `MIC_DEVICE_NAME=<substring>`
+  - With `LOG_LEVEL=DEBUG` the gateway lists input-capable devices with indices at startup.
+
 ## Alternative (pip/venv)
 ```bash
 python3 -m venv .venv

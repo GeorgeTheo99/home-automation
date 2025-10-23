@@ -612,12 +612,18 @@ async def run_realtime_session(
                         result.error_code = code
                         result.error_message = message
                         if code == "input_audio_buffer_commit_empty":
+                            # If we already captured audio, saw VAD, or received a transcript,
+                            # treat this as a soft error and exit the receive loop gracefully so
+                            # downstream fallback handling can decide what to do. This avoids
+                            # dropping valid transcripts due to timing races.
                             logger("INFO", "Realtime session: no speech detected after wake word.")
                             result.voice_activity_detected = voice_activity_detected
                             result.speech_segments = speech_segments
                             result.peak_amplitude = peak_value
-                            result.noise_detected = True
-                            return result
+                            # Mark as noise only if there was truly nothing captured and no transcript.
+                            if not result.transcript and total_input_samples <= 0 and not voice_activity_detected:
+                                result.noise_detected = True
+                            break
 
                         raise RealtimeError(str(err_payload))
 
@@ -681,6 +687,7 @@ async def run_realtime_session(
                     and not collected_audio
                     and not result.audio_played
                     and not voice_activity_detected
+                    and not result.transcript
                     and config.noise_threshold > 0
                     and peak_value <= config.noise_threshold
                 )
