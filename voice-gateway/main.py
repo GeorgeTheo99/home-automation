@@ -90,7 +90,7 @@ REALTIME_SERVER_VAD = os.getenv("REALTIME_SERVER_VAD", "true").lower() == "true"
 REALTIME_VAD_THRESHOLD = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.5"))
 REALTIME_VAD_SILENCE_MS = int(max(0.0, float(os.getenv("REALTIME_VAD_SILENCE_MS", "350"))))
 REALTIME_VAD_PREFIX_MS = int(max(0.0, float(os.getenv("REALTIME_VAD_PREFIX_MS", "300"))))
-_REALTIME_VAD_IDLE_RAW = os.getenv("REALTIME_VAD_IDLE_TIMEOUT_MS", "").strip()
+_REALTIME_VAD_IDLE_RAW = os.getenv("REALTIME_VAD_IDLE_TIMEOUT_MS", "5000").strip()
 if not _REALTIME_VAD_IDLE_RAW or _REALTIME_VAD_IDLE_RAW.lower() == "none":
     REALTIME_VAD_IDLE_TIMEOUT_MS = None
 else:
@@ -976,6 +976,16 @@ def main():
                 followup_block_counter = 0
                 conversation_active = False
                 prev_followup_active = False
+                realtime_conversation: Optional[realtime.RealtimeConversation] = None
+
+                def close_realtime_session() -> None:
+                    nonlocal realtime_conversation
+                    if realtime_conversation is not None:
+                        try:
+                            realtime_conversation.close()
+                        except Exception as exc:
+                            log("WARN", f"Realtime conversation close failed: {exc}")
+                        realtime_conversation = None
                 last_debug_tick = 0.0
                 while True:
                     frames, overflowed = stream.read(stream_block)
@@ -1013,44 +1023,34 @@ def main():
                     trigger_reason: Optional[str] = None
 
                     can_listen = now >= ASSISTANT_SPEAK_UNTIL and now >= MUTE_UNTIL and now >= hysteresis_until
-                    if (
-                        FOLLOWUP_ENABLED
-                        and conversation_active
-                        and can_listen
-                        and rms >= FOLLOWUP_MIN_RMS
-                        and peak >= FOLLOWUP_MIN_PEAK
-                    ):
-                        followup_until = max(followup_until, now + FOLLOWUP_WINDOW_SEC)
-
+                    # Always allow a follow-up listening window after any assistant response,
+                    # without requiring the old RMS/PEAK gating. This makes follow-ups
+                    # reliably arm and immediately start capture as soon as we're allowed
+                    # to listen again.
                     followup_active = FOLLOWUP_ENABLED and followup_until > now
                     if prev_followup_active and not followup_active:
                         if FOLLOWUP_ENABLED and LOG_LEVEL == "DEBUG":
                             log("DEBUG", "Follow-up window expired.")
                         followup_until = 0.0
                         conversation_active = False
+                        close_realtime_session()
 
                     if followup_active:
-                        if not conversation_active:
+                        if not conversation_active or not can_listen:
                             prev_followup_active = followup_active
                             continue
-                        if not can_listen:
-                            prev_followup_active = followup_active
-                            continue
-                        if rms >= FOLLOWUP_MIN_RMS:
-                            followup_block_counter += 1
-                        else:
-                            followup_block_counter = 0
-                        if followup_block_counter >= FOLLOWUP_TRIGGER_BLOCKS:
-                            trigger_reason = "followup"
-                            followup_block_counter = 0
-                            followup_until = max(
-                                followup_until, now + max(FOLLOWUP_SILENCE_SEC, FOLLOWUP_WINDOW_SEC)
-                            )
+                        # Auto-trigger follow-up capture immediately when the window is active
+                        # and we can listen. Server VAD (if enabled) will hold until speech.
+                        trigger_reason = "followup"
+                        followup_block_counter = 0
+                        # Consume the window so we don't re-trigger repeatedly while capturing
+                        followup_until = 0.0
                     else:
                         followup_block_counter = 0
 
                     prev_followup_active = followup_active
 
+                    # If follow-up window is active we already triggered capture above.
                     if followup_active and trigger_reason is None:
                         continue
 
@@ -1076,7 +1076,10 @@ def main():
                             if last_candidate_ts and (now - last_candidate_ts) > WAKE_STREAK_WINDOW_SEC:
                                 streak = 0
                             candidate_streak = streak + 1
-                            if candidate_streak >= WAKE_STREAK and match_score < WAKE_FINAL_THRESHOLD:
+                            if match_score >= WAKE_FINAL_THRESHOLD:
+                                streak = WAKE_STREAK
+                                last_candidate_ts = now
+                            elif candidate_streak >= WAKE_STREAK:
                                 streak = max(0, WAKE_STREAK - 1)
                                 last_candidate_ts = now
                             else:
@@ -1104,7 +1107,13 @@ def main():
                         last_wake_ts = now
                         MUTE_UNTIL = max(MUTE_UNTIL, now + STREAM_BLOCK_SEC)
                         hysteresis_until = max(hysteresis_until, now + STREAM_BLOCK_SEC)
-                        log("INFO", "Follow-up speech detected; continuing conversation.")
+                        # When we auto-trigger a follow-up (no RMS/peak gating), avoid
+                        # the misleading INFO log implying speech was detected.
+                        if trigger_reason == "followup":
+                            if LOG_LEVEL == "DEBUG":
+                                log("DEBUG", "Follow-up capture started (auto window).")
+                        else:
+                            log("INFO", "Speech detected; continuing conversation.")
                     pre_audio = np.concatenate(list(pre_buffer)) if pre_buffer_samples and pre_buffer else np.empty((0,), dtype=np.int16)
                     current_chunk = samples_i16.astype(np.int16, copy=False)
                     initial_parts: List[np.ndarray] = []
@@ -1173,46 +1182,44 @@ def main():
                                     min_listen_ms = max(REALTIME_MIN_INPUT_AUDIO_MS, derived_ms)
                                     min_listen_secs = max(min_listen_ms / 1000.0, POST_WAKE_RECORD_SECS)
                                 max_audio_secs = max(REALTIME_MAX_AUDIO_SECS, min_listen_secs)
-                                if trigger_reason == "followup" and FOLLOWUP_MAX_CAPTURE_SEC > 0:
-                                    max_audio_secs = min(max_audio_secs, FOLLOWUP_MAX_CAPTURE_SEC)
-                                rt_config = realtime.RealtimeConfig(
-                                    api_key=OPENAI_API_KEY,
-                                    model=REALTIME_MODEL,
-                                    modalities=REALTIME_MODALITIES,
-                                    voice=REALTIME_VOICE if REALTIME_EXPECT_AUDIO else None,
-                                    temperature=max(0.6, REALTIME_TEMPERATURE),
-                                    session_timeout=REALTIME_SESSION_TIMEOUT,
-                                    max_audio_secs=max_audio_secs,
-                                    send_audio=True,
-                                    expect_audio_output=REALTIME_EXPECT_AUDIO,
-                                    input_sample_rate=SAMPLE_RATE,
-                                    stream_sample_rate=REALTIME_STREAM_SAMPLE_RATE,
-                                    post_command_mute=POST_COMMAND_MUTE_SEC,
-                                    playback_guard=REALTIME_PLAYBACK_GUARD_SEC,
-                                    server_vad_enabled=REALTIME_SERVER_VAD,
-                                    server_vad_threshold=REALTIME_VAD_THRESHOLD,
-                                    server_vad_silence_ms=REALTIME_VAD_SILENCE_MS,
-                                    server_vad_prefix_padding_ms=REALTIME_VAD_PREFIX_MS,
-                                    server_vad_idle_timeout_ms=REALTIME_VAD_IDLE_TIMEOUT_MS,
-                                    min_input_audio_ms=min_listen_ms,
-                                    noise_threshold=REALTIME_NOISE_PEAK,
-                                    force_create_response=REALTIME_FORCE_CREATE_RESPONSE,
-                                    force_response_delay_ms=REALTIME_FORCE_RESPONSE_DELAY_MS,
-                                    fallback_no_speech=REALTIME_FALLBACK_NO_SPEECH,
-                                    fallback_no_response=REALTIME_FALLBACK_NO_RESPONSE,
-                                )
+                                if trigger_reason == "followup":
+                                    max_audio_secs = max(
+                                        max_audio_secs,
+                                        FOLLOWUP_WINDOW_SEC + max(REALTIME_MAX_AUDIO_SECS, 3.0),
+                                    )
+                                    if FOLLOWUP_MAX_CAPTURE_SEC > 0:
+                                        max_audio_secs = max(max_audio_secs, FOLLOWUP_MAX_CAPTURE_SEC, FOLLOWUP_WINDOW_SEC)
 
-                                live_reader = None
-                                if REALTIME_SERVER_VAD:
-
-                                    def live_reader(block: int = stream_block) -> np.ndarray:
-                                        frames, _ = stream.read(block)
-                                        return np.asarray(frames, dtype=np.int16).flatten()
-
-                                realtime_result = asyncio.run(
-                                    realtime.run_realtime_session(
-                                        pcm_initial,
-                                        rt_config,
+                                config_obj: Optional[realtime.RealtimeConfig]
+                                if realtime_conversation is None:
+                                    config_obj = realtime.RealtimeConfig(
+                                        api_key=OPENAI_API_KEY,
+                                        model=REALTIME_MODEL,
+                                        modalities=REALTIME_MODALITIES,
+                                        voice=REALTIME_VOICE if REALTIME_EXPECT_AUDIO else None,
+                                        temperature=max(0.6, REALTIME_TEMPERATURE),
+                                        session_timeout=REALTIME_SESSION_TIMEOUT,
+                                        max_audio_secs=max_audio_secs,
+                                        send_audio=True,
+                                        expect_audio_output=REALTIME_EXPECT_AUDIO,
+                                        input_sample_rate=SAMPLE_RATE,
+                                        stream_sample_rate=REALTIME_STREAM_SAMPLE_RATE,
+                                        post_command_mute=POST_COMMAND_MUTE_SEC,
+                                        playback_guard=REALTIME_PLAYBACK_GUARD_SEC,
+                                        server_vad_enabled=REALTIME_SERVER_VAD,
+                                        server_vad_threshold=REALTIME_VAD_THRESHOLD,
+                                        server_vad_silence_ms=REALTIME_VAD_SILENCE_MS,
+                                        server_vad_prefix_padding_ms=REALTIME_VAD_PREFIX_MS,
+                                        server_vad_idle_timeout_ms=REALTIME_VAD_IDLE_TIMEOUT_MS,
+                                        min_input_audio_ms=min_listen_ms,
+                                        noise_threshold=REALTIME_NOISE_PEAK,
+                                        force_create_response=REALTIME_FORCE_CREATE_RESPONSE,
+                                        force_response_delay_ms=REALTIME_FORCE_RESPONSE_DELAY_MS,
+                                        fallback_no_speech=REALTIME_FALLBACK_NO_SPEECH,
+                                        fallback_no_response=REALTIME_FALLBACK_NO_RESPONSE,
+                                    )
+                                    realtime_conversation = realtime.RealtimeConversation(
+                                        config_obj,
                                         NLU_ENTITY_CONTEXT,
                                         REALTIME_SYSTEM_PROMPT,
                                         ha_call,
@@ -1220,12 +1227,43 @@ def main():
                                         speak if SPEAK_ENABLED else (lambda _: None),
                                         extend_mute,
                                         log,
-                                        live_audio_reader=live_reader if REALTIME_SERVER_VAD else None,
-                                        live_audio_block=stream_block,
                                     )
+                                else:
+                                    config_obj = realtime_conversation.config
+                                    config_obj.session_timeout = REALTIME_SESSION_TIMEOUT
+                                    config_obj.stream_sample_rate = REALTIME_STREAM_SAMPLE_RATE
+                                    config_obj.post_command_mute = POST_COMMAND_MUTE_SEC
+                                    config_obj.playback_guard = REALTIME_PLAYBACK_GUARD_SEC
+                                    config_obj.server_vad_enabled = REALTIME_SERVER_VAD
+                                    config_obj.server_vad_threshold = REALTIME_VAD_THRESHOLD
+                                    config_obj.server_vad_silence_ms = REALTIME_VAD_SILENCE_MS
+                                    config_obj.server_vad_prefix_padding_ms = REALTIME_VAD_PREFIX_MS
+                                    config_obj.server_vad_idle_timeout_ms = REALTIME_VAD_IDLE_TIMEOUT_MS
+                                    config_obj.noise_threshold = REALTIME_NOISE_PEAK
+                                    config_obj.force_create_response = REALTIME_FORCE_CREATE_RESPONSE
+                                    config_obj.force_response_delay_ms = REALTIME_FORCE_RESPONSE_DELAY_MS
+                                    config_obj.expect_audio_output = REALTIME_EXPECT_AUDIO
+                                    config_obj.send_audio = True
+                                    config_obj.voice = REALTIME_VOICE if REALTIME_EXPECT_AUDIO else None
+                                if config_obj is not None:
+                                    config_obj.min_input_audio_ms = min_listen_ms
+                                    config_obj.max_audio_secs = max_audio_secs
+
+                                live_reader_fn: Optional[Callable[[int], np.ndarray]] = None
+                                if REALTIME_SERVER_VAD:
+
+                                    def live_reader_fn(block: int = stream_block) -> np.ndarray:
+                                        frames, _ = stream.read(block)
+                                        return np.asarray(frames, dtype=np.int16).flatten()
+
+                                realtime_result = realtime_conversation.send_turn(
+                                    pcm_initial,
+                                    live_audio_reader=live_reader_fn if REALTIME_SERVER_VAD else None,
+                                    live_audio_block=stream_block,
                                 )
                             except Exception as ex:
                                 log("ERROR", f"Realtime session failed: {ex}")
+                                close_realtime_session()
                     if realtime_result:
                         log(
                             "DEBUG",
@@ -1303,6 +1341,7 @@ def main():
                     if FOLLOWUP_ENABLED:
                         followup_until = 0.0
                         conversation_active = False
+                        close_realtime_session()
                     _captured = getattr(realtime_result, "captured_audio", None)
                     captured_ms = 0.0
                     if isinstance(_captured, np.ndarray) and SAMPLE_RATE:
@@ -1387,6 +1426,7 @@ def main():
                         if FOLLOWUP_ENABLED:
                             followup_until = 0.0
                             conversation_active = False
+                            close_realtime_session()
                         log("INFO", "Legacy pipeline disabled; no fallback response generated.")
                         extend_mute(POST_COMMAND_MUTE_SEC)
                         continue
@@ -1395,6 +1435,7 @@ def main():
                         if FOLLOWUP_ENABLED:
                             followup_until = 0.0
                             conversation_active = False
+                            close_realtime_session()
                         log("WARN", "Legacy fallback skipped: insufficient audio captured.")
                         continue
 
@@ -1455,13 +1496,16 @@ def main():
                     except Exception as ex:
                         log("ERROR", f"HA call failed: {ex}")
         except KeyboardInterrupt:
+            close_realtime_session()
             log("INFO", "Shutting down voice gateway.")
             break
         except sd.PortAudioError as err:
+            close_realtime_session()
             log("ERROR", f"Audio interface error: {err}; restarting input stream.")
             time.sleep(0.5)
             continue
         except Exception as err:
+            close_realtime_session()
             log("ERROR", f"Unexpected error in audio loop: {err}")
             time.sleep(1.0)
 
