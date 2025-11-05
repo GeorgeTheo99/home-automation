@@ -1,6 +1,7 @@
-openwakeword>=0.6.0
-sounddevice>=0.4.6
 numpy>=1.24
+sounddevice>=0.4.6
 requests>=2.31
 python-dotenv>=1.0.0
-openai>=1.44.0
+torch>=2.0.0
+websockets>=12.0
+vosk>=0.3.45

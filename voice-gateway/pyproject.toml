@@ -1,16 +1,17 @@
 [project]
 name = "voice-gateway"
 version = "0.1.0"
-description = "Wake word → STT (Whisper API) → GPT JSON → Home Assistant"
-requires-python = ">=3.10,<3.12"  # OpenWakeWord/tflite-runtime wheels available on 3.10/3.11
+description = "Vosk wake word + Silero VAD + OpenAI Realtime voice assistant"
+requires-python = ">=3.10"
 dependencies = [
-  "openwakeword==0.5.1",
-  "sounddevice>=0.4.6",
   "numpy>=1.24,<2",
+  "sounddevice>=0.4.6",
   "requests>=2.31",
   "python-dotenv>=1.0.0",
-  "openai>=1.44.0",
+  "torch>=2.0.0",
   "websockets>=12.0",
+  "vosk>=0.3.45",
+  "torchaudio>=2.9.0",
 ]
 
 [tool.uv]

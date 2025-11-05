@@ -1,214 +1,116 @@
-# Voice Gateway (Path A)
+# Voice Gateway (Realtime)
 
-Wake word (local) → STT (OpenAI Whisper API) → NLU (GPT‑5 JSON) → Home Assistant REST.
+Local wake word + local VAD + OpenAI Realtime (gpt-streaming) for ASR, NLU, TTS, and tool calls. The pipeline:
 
-## Prerequisites
-- Ubuntu/Linux host with microphone access
-- Home Assistant running (Container is fine) and a Long‑Lived Access Token
-- Python 3.10+
-- System packages
-  - `sudo apt update && sudo apt install -y python3-venv python3-pip portaudio19-dev ffmpeg espeak-ng alsa-utils`
-
-## Setup (uv recommended)
-Install uv (once):
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# then restart your shell or: source ~/.local/bin/env
+```
+Vosk wake word → Silero VAD endpointing → OpenAI Realtime WebSocket → Home Assistant / Weather tools → PCM audio playback
 ```
 
-Install a Python toolchain that works with OpenWakeWord (Python 3.11 recommended):
-```bash
-uv python install 3.11
-```
+## Requirements
 
-Create environment and install deps:
-```bash
-cd /home/georgetheo/home_automation/voice-gateway
-uv venv -p 3.11  # creates .venv with Python 3.11
-uv sync  # installs dependencies from pyproject.toml
+- Linux host with microphone and speaker access.
+- Python 3.10+ with `pip` (or [`uv`](https://docs.astral.sh/uv/latest/)).
+- Local Vosk model directory (e.g. `vosk-model-small-en-us-0.15`).
+- OpenAI API key with access to the Realtime API.
+- Optional: Home Assistant instance and long-lived access token if you want voice control.
 
-cp .env.example .env
-# Edit .env: set HA_URL, HA_TOKEN, OPENAI_API_KEY
-```
+## Setup
 
-Run (no activation needed):
-```bash
-uv run python main.py
-```
+1. **Create a Python environment and install dependencies**
 
-## Audio Setup (PipeWire recommended)
-We configured PipeWire (user session) and set Built‑in Analog Stereo as the default sink/source.
+   ```bash
+   cd /home/georgetheo/home_automation/voice-gateway
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
 
-1) Install/enable PipeWire + WirePlumber
-```bash
-sudo apt install -y pipewire pipewire-audio-client-libraries wireplumber
-systemctl --user enable --now pipewire pipewire-pulse wireplumber
-```
+   (If you prefer `uv`, run `uv venv` and `uv sync` instead.)
 
-2) Set defaults and unmute via `wpctl`
-```bash
-wpctl status
-# Identify your Built-in Analog Stereo sink and source IDs (e.g., sink=48, source=49)
-wpctl set-default 48
-wpctl set-default 49
-wpctl set-mute 49 0
-wpctl set-volume 49 0.85
-```
+2. **Provision Vosk**
 
-3) Verify mic levels (RMS should rise when you speak)
-```bash
-uv run python - <<'PY'
-import numpy as np, sounddevice as sd
-def rms(idx):
-    a = sd.rec(int(0.5*16000), samplerate=16000, channels=1, dtype='int16', device=idx); sd.wait()
-    x = a.flatten().astype('float32')/32768.0
-    return float(np.sqrt((x*x).mean()))
-print('Default devices (in,out):', sd.default.device)
-for i in [13,5]:
-    try: print(i, 'RMS=', rms(i))
-    except Exception as e: print(i, 'error:', e)
-PY
-```
+   - Download a lightweight Vosk English model (for example, [`vosk-model-small-en-us-0.15`](https://alphacephei.com/vosk/models)).
+   - Extract it somewhere accessible, such as `~/models/vosk-model-small-en-us-0.15`.
+   - Point `VOSK_MODEL_PATH` at the extracted directory.
 
-If you prefer ALSA‑only (no PipeWire), use `alsamixer -c 0` to enable/unmute Capture and `arecord -D default` to test.
+3. **Create `.env` (or export variables)**
 
-### Silent Input Troubleshooting
-- If logs show `Mic peak=0 rms=0.0000` constantly, your default source may not be set.
-  - Run `wpctl status`, note the Sources section, then set a default: `wpctl set-default <source-id>`.
-  - If using AUX/line-in, ensure the input port is selected: `wpctl set-port <source-id> analog-input-linein` (or `analog-input-internal-mic`).
-- You can let the gateway perform these at startup by setting envs in `voice-gateway/.env`:
-  - `WPCTL_SOURCE_ID=47` and `WPCTL_SET_DEFAULT=true`
-  - `WPCTL_SET_PORT=analog-input-linein`
-- As an alternative, explicitly pin a device in `.env` without changing system defaults:
-  - `MIC_DEVICE_INDEX=<index>` or `MIC_DEVICE_NAME=<substring>`
-  - With `LOG_LEVEL=DEBUG` the gateway lists input-capable devices with indices at startup.
+   ```bash
+   cp .env.example .env  # if you keep one checked in
+   ```
 
-## Alternative (pip/venv)
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+   Required environment variables:
 
-Optional: list microphones with indices and defaults
-```bash
-uv run python - <<'PY'
-import sounddevice as sd
-for i, d in enumerate(sd.query_devices()):
-    print(i, d['name'], 'in_channels=', d.get('max_input_channels', 0))
-print('Default devices (in,out):', sd.default.device)
-PY
-# Then set MIC_DEVICE_INDEX or MIC_DEVICE_NAME in .env
-```
+   - `OPENAI_API_KEY` – Realtime WebSocket API key.
+   - `VOSK_MODEL_PATH` – directory containing the Vosk acoustic model (defaults to `models/vosk-model-small-en-us-0.15`).
+   - `HA_URL` / `HA_TOKEN` – Home Assistant base URL and long-lived token (optional but required for home control).
 
-## Run
-Using uv:
-```bash
-uv run python main.py
-```
-or with an activated venv:
+   Useful optional variables:
+
+   | Variable | Default | Description |
+   | --- | --- | --- |
+   | `REALTIME_MODEL` | `gpt-realtime-2025-08-28` | Realtime model ID. |
+   | `REALTIME_MODALITIES` | `audio,text` | Comma separated modalities for responses. |
+   | `REALTIME_TEMPERATURE` | `0.2` | Sampling temperature. |
+   | `MIC_DEVICE_NAME` / `MIC_DEVICE_INDEX` | | Pin a capture device for sounddevice. |
+   | `SPEAKER_DEVICE_NAME` / `SPEAKER_DEVICE_INDEX` | | Pin a playback device. |
+   | `INPUT_GAIN` | `1.0` | Linear gain applied to mic PCM before VAD/wake. |
+   | `FOLLOWUP_ENABLED` | `true` | Enable follow-up window after responses. |
+   | `FOLLOWUP_ARM_MODE` | `question_only` | `question_only` or `always` to arm follow-ups. |
+   | `FOLLOWUP_WINDOW_SEC` | `6.0` | Length of the follow-up window. |
+   | `FOLLOWUP_GUARD_MS` | `400` | Guard period after playback before re-arming (ms). |
+   | `FOLLOWUP_MIN_RMS` / `FOLLOWUP_MIN_PEAK` | | Optional gating thresholds for follow-up speech. |
+   | `WAKEWORD_PHRASES` | `hey computer` | Comma-separated wake word phrases (e.g., `hey computer,ok computer`). |
+   | `WAKE_CONFIDENCE_THRESHOLD` | `0.6` | Minimum Vosk confidence to accept a wake detection (recommend 0.5–0.6 with a constrained grammar). |
+   | `WAKE_DEBOUNCE_MS` | `1200` | Debounce period after a trigger (milliseconds). |
+   | `WEATHER_API_URL` | `https://wttr.in` | Weather lookup base URL. |
+   | `WEATHER_DEFAULT_LOCATION` | | Default location for weather tool. |
+
+## Running
+
+Activate your environment (if required) and launch the gateway:
+
 ```bash
 source .venv/bin/activate
 python main.py
 ```
-Speak the wake word (e.g., "hey jarvis"), then try:
-- "kitchen lights on"
-- "kitchen lights 50 percent"
-- "living room lights off"
 
-If your entity IDs differ, the gateway builds aliases from HA friendly names automatically at startup. You can also add/override regexes in `ALIASES_STATIC` inside `main.py`.
+On startup the logs will confirm Vosk, Silero VAD, and the Realtime websocket session have initialised. Say “hey computer …” or “ok computer …” (or your configured wake phrase) to begin a turn. After each spoken answer, the gateway arms a six second follow-up window (when enabled) so you can continue speaking without the wake word if the assistant asked a question.
 
-## Systemd (optional)
-Create a user service:
-```bash
-mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/ha-voice-gateway.service <<'UNIT'
-[Unit]
-Description=HA Voice Gateway (wake word -> STT -> GPT-5 -> HA)
-After=network-online.target sound.target
+## Tools
 
-[Service]
-Type=simple
-WorkingDirectory=%h/home_automation/voice-gateway
-Environment=PYTHONUNBUFFERED=1
-ExecStart=%h/home_automation/voice-gateway/.venv/bin/python %h/home_automation/voice-gateway/main.py
-Restart=on-failure
+Two tools are registered with the Realtime session:
 
-[Install]
-WantedBy=default.target
-UNIT
+- `home_assistant_call_service` – calls Home Assistant REST services (`domain`, `service`, optional `entity_id`, `data`).
+- `get_weather_summary` – fetches a concise weather summary using `wttr.in` (honours `WEATHER_DEFAULT_LOCATION`).
 
-systemctl --user daemon-reload
-systemctl --user enable ha-voice-gateway
-systemctl --user start ha-voice-gateway
-journalctl --user -u ha-voice-gateway -f
+The tool registry validates arguments and raises descriptive errors if Home Assistant isn’t configured.
+
+## Manual Test Plan
+
+1. Set `OPENAI_API_KEY`, optionally override `VOSK_MODEL_PATH` (defaults to `models/vosk-model-small-en-us-0.15`), configure `WAKEWORD_PHRASES` if desired, and (optionally) `HA_URL`/`HA_TOKEN`.
+2. `python main.py`
+3. Say “computer, turn on the kitchen lights” – confirm a Home Assistant service call and spoken confirmation.
+4. Say “computer, what’s the weather?” – confirm a concise spoken summary.
+5. Trigger a follow-up by asking a question that elicits one (“computer, set a reminder”). After the assistant replies, answer the follow-up question within the six second window without using the wake word.
+
+## Troubleshooting
+
+- **No wake detection** – ensure `VOSK_MODEL_PATH` points to a valid Vosk model directory and the wake phrases are audible. Adjust `WAKE_CONFIDENCE_THRESHOLD` (lower it slightly) or `INPUT_GAIN` if detections are missed.
+- **Realtime errors** – check the log for `Realtime processing failed` messages. Network connectivity is required while streaming.
+- **Follow-up false triggers** – increase `FOLLOWUP_MIN_RMS` (e.g. `0.02`) or `FOLLOWUP_MIN_PEAK` (e.g. `4500`) to demand stronger speech energy.
+- **Device selection** – run `python -c "import sounddevice as sd; print(sd.query_devices())"` to inspect indices, then set the `*_DEVICE_*` env vars.
+
+## Project Structure
+
+```
+config.py                 # environment parsing
+main.py                   # state machine orchestrator
+audio/                    # microphone and speaker abstractions
+wake/vosk.py              # wake word detector
+vad/silero.py             # streaming VAD + endpointing
+gpt/realtime_client.py    # OpenAI Realtime websocket client
+tools/                    # Home Assistant + weather tools
 ```
 
-## Notes
-- This gateway avoids HA’s Assist/Wyoming UI entirely.
-- STT uses OpenAI's `gpt-4o-mini-transcribe` API (successor to Whisper); no local model cache required.
-- NLU uses `MODEL_NAME` (default: `gpt-5`). If unavailable, set to `gpt-4o-mini` or `gpt-4.1`.
-  - Some models enforce default temperature; set `NLU_TEMPERATURE=1.0` (default) or let the app auto-retry without temperature.
-- The realtime path falls back to the classic Whisper+GPT pipeline only when you explicitly set `LEGACY_PIPELINE_ENABLED=true`.
-- The gateway allow‑lists HA services for safety (lights/switches by default).
-- Local speak-back uses `espeak-ng` by default. You can adjust voice/rate via `.env`.
-- GPT NLU gets a JSON array of valid entities (friendly names, room/area, aliases) extracted from HA at startup. Keep entity names in HA up to date for best results.
-
-## Realtime Mode (Experimental)
-- Set `REALTIME_ENABLED=true` in `.env` to use OpenAI’s realtime WebSocket API instead of Whisper+chat.
-- Requires access to a realtime-capable model (e.g., `gpt-realtime-preview`). Configure:
-  - Existing configs that still list the deprecated `gpt-voice-40` will be remapped automatically to `gpt-realtime-preview`.
-  - `REALTIME_MODEL`, `REALTIME_MODALITIES` (`audio,text` for voiced replies), `REALTIME_VOICE`, `REALTIME_TEMPERATURE`.
-  - `REALTIME_MAX_AUDIO_SECS` limits how much post-wake audio is sent.
-  - `REALTIME_SESSION_TIMEOUT` aborts slow sessions; the pipeline falls back to Whisper + GPT on failure.
-  - `REALTIME_PLAYBACK_GUARD_SEC` adds padding to the mic mute window while GPT audio is playing.
-  - When server VAD is enabled we now allow short (~600 ms) follow-ups; raise or lower `REALTIME_MIN_INPUT_AUDIO_MS` (default 900 ms) to require more audio before committing.
-- Server-side VAD is enabled by default (`REALTIME_SERVER_VAD=true`). Tune detection via `REALTIME_VAD_THRESHOLD`, `REALTIME_VAD_SILENCE_MS` (default 350 ms), `REALTIME_VAD_PREFIX_MS`, and optional `REALTIME_VAD_IDLE_TIMEOUT_MS`.
-- `REALTIME_PREFETCH_SEC` (default 0.35 s) captures a short lead-in while the realtime session negotiates. `REALTIME_MIN_INPUT_AUDIO_MS` gates the minimum capture length (default 900 ms with server VAD, otherwise at least `POST_WAKE_RECORD_SECS`).
-- Current OpenAI policy requires `temperature >= 0.6`; the code clamps lower values automatically, but set it to ~0.7 for best results.
-- `REALTIME_FORCE_CREATE_RESPONSE` (default `true`) nudges the model with a manual `response.create` if it stays silent; tune `REALTIME_FORCE_RESPONSE_DELAY_MS` (ms) to wait longer before issuing the nudge.
-- Local fallbacks stay silent unless you opt in. Set `REALTIME_FALLBACK_NO_SPEECH` or `REALTIME_FALLBACK_NO_RESPONSE` if you want the gateway to apologize when realtime can’t understand or respond.
-- `FOLLOWUP_ENABLED` (default `true`) opens a follow-up window after each assistant reply so you can keep talking without repeating the wake word. Adjust `FOLLOWUP_WINDOW_SEC` (default 5 s), `FOLLOWUP_MIN_RMS`, `FOLLOWUP_MIN_PEAK`, `FOLLOWUP_TRIGGER_BLOCKS`, `FOLLOWUP_MIN_ACTIVE_MS`, `FOLLOWUP_SILENCE_SEC`, and `FOLLOWUP_MAX_CAPTURE_SEC` if you need a longer (or stricter) conversational tail.
-- The gateway defines a `call_home_assistant` tool. GPT streams a tool call, we execute it via HA REST, and send a tool result back so the model can confirm.
-- Actions detected via the tool call trigger a local chime instead of GPT speech. Configure the file/tone via `ACTION_CHIME_*`, or set `ACTION_CHIME_ENABLED=false` to fall back to TTS confirmations.
-- Informational answers stream GPT audio (`REALTIME_MODALITIES` includes `audio`). If no audio arrives, the gateway falls back to local `speak()`.
-- Troubleshooting:
-  - Check logs for `Realtime session error` messages.
-  - Some events/field names may evolve; adjust in `realtime.py` if OpenAI changes their schema.
-- Tweak `REALTIME_NOISE_PEAK` if quiet speech is being discarded or background hum still produces prompts.
-- The fallback path (Whisper + GPT) runs only if `LEGACY_PIPELINE_ENABLED=true`. If you want that behavior, opt in explicitly.
-- For faster wake-word rearm in realtime mode, lower `WAKE_COOLDOWN_SEC` (e.g. `0.4–0.6`) and adjust `WAKE_RETRIGGER_SUPPRESS_SEC` (default `0.6`) to balance latency vs. false re-triggers.
-- Realtime responses are forced to English; when only noise is captured (peak below `REALTIME_NOISE_PEAK` with no transcript), the session is dropped politely.
-
-### Latency Tips
-- Shorten `POST_WAKE_RECORD_SECS` and `REALTIME_MAX_AUDIO_SECS` (e.g., 1.5–2.0 seconds) to ship less audio.
-- For realtime sessions, keep `REALTIME_MODALITIES` to `text` if you don’t need voice replies.
-- If you stick with the classic pipeline, switch `MODEL_NAME` to `gpt-4o-mini` or enable fast-paths (`NLU_MODE=fast_first`) so simple light commands avoid GPT entirely.
-- Local STT (`faster-whisper`) can still be enabled later if you need a fully offline path.
-
-### NLU Modes
-- `fast_only`: Only use local regex fast-paths (on/off, brightness %, simple colors) with HA entity aliasing from friendly names.
-- `fast_first`: Try fast-paths, fall back to GPT JSON if no match. (default)
-- `gpt_only`: Always call GPT for NLU; disables fast-paths.
-  - Enable logs with `LOG_NLU=true` to see which path was used and the final JSON.
-
-## Wake Word Troubleshooting
-- Default wakeword: `hey_jarvis`. Saying “weather” will not trigger; only the configured wakeword (or any `hey_*` model in fallback) does.
-- To narrow detection, set `WAKEWORD_MODEL` to the bundled model:
-  - `voice-gateway/.venv/lib/python3.11/site-packages/openwakeword/resources/models/hey_jarvis_v0.1.tflite`
-- Tune sensitivity: try `WAKE_THRESHOLD=0.10..0.55`, `WAKE_BLOCK_SEC=1.0`, `STREAM_BLOCK_SEC=0.2`.
-- With `LOG_LEVEL=DEBUG`, you’ll see `RMS` and top scores. RMS should rise when you speak.
-- If RMS is low and scores stay tiny, increase `INPUT_GAIN` (e.g., 2.0–6.0). Keep RMS generally below ~0.3 to avoid heavy clipping.
-- Avoid double triggers: increase `WAKE_COOLDOWN_SEC` (e.g., >= `POST_WAKE_RECORD_SECS + 0.5`) and/or require a short streak with `WAKE_STREAK=2`.
-- Add hysteresis: `WAKE_HYSTERESIS_SEC` adds extra guard time after cooldown to ignore trailing echoes/background voice.
-- Fine-tune streak logic: `WAKE_STREAK_WINDOW_SEC` keeps the detection burst tight while `WAKE_FINAL_THRESHOLD` asks for a stronger final score.
-- Post-command mute: bump `POST_COMMAND_MUTE_SEC` to keep the mic ignored briefly after HA/GPT responses.
-- Clamp noisy playback: `WAKE_RMS_DECAY`, `WAKE_RMS_CLAMP_RATIO`, `WAKE_RMS_CLAMP_ABS`, and `WAKE_NOISE_HOLD_SEC` hold the detector while room audio is loud.
-- Capture the very start of speech: `PRE_WAKE_BUFFER_SEC` keeps ~0.5–0.8 s of audio before the wake hit so the first words (“turn on…”) aren’t clipped.
-
-## Remove old Whisper cache (manual)
-If present, remove the legacy cache directory used for offline STT:
-```bash
-rm -rf /home/georgetheo/home_automation/whisper-cache
-```
+Logs (INFO level) show state transitions, tool results, and assistant summaries. Enable more detailed diagnostics by editing `main.py` to raise the logging level if needed.
