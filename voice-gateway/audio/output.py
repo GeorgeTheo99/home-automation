@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import sounddevice as sd
@@ -17,6 +18,14 @@ class AudioOutputError(RuntimeError):
     """Raised when speaker playback cannot be initialised."""
 
 
+def _preferred_name_list(env_var: str, defaults: List[str]) -> List[str]:
+    raw = os.getenv(env_var, "")
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()] if raw else []
+    if not parts:
+        parts = defaults
+    return parts
+
+
 def _resolve_device(device_name: Optional[str], device_index: Optional[int]) -> Optional[int]:
     if device_index is not None:
         return device_index
@@ -24,6 +33,18 @@ def _resolve_device(device_name: Optional[str], device_index: Optional[int]) -> 
         return None
     name_lower = device_name.strip().lower()
     if name_lower in {"pipewire", "pulse", "pulseaudio", "default", "auto"}:
+        # Heuristic: prefer known good output devices if available (e.g., Edifier).
+        try:
+            prefs = _preferred_name_list("SPEAKER_PREFERRED_NAMES", ["edifier", "speaker", "usb audio", "r19u"]) 
+            for index, info in enumerate(sd.query_devices()):
+                if info.get("max_output_channels", 0) <= 0:
+                    continue
+                devname = str(info.get("name", "")).lower()
+                if any(p in devname for p in prefs):
+                    logger.info("AudioOutput: auto-selecting output device %s (index=%s) via preferred names %s.", info.get("name"), index, prefs)
+                    return index
+        except Exception:
+            pass
         return None
     for index, info in enumerate(sd.query_devices()):
         if info.get("max_output_channels", 0) <= 0:
@@ -59,12 +80,18 @@ class AudioOutput:
         self.input_sample_rate = int(self.sample_rate)
         self._closed = False
         device = _resolve_device(self.device_name, self.device_index)
+        dev_info = None
+        try:
+            dev_info = sd.query_devices(device, kind="output")
+        except Exception:
+            dev_info = None
         logger.info(
-            "AudioOutput: opening stream (requested_sample_rate=%d, channels=%d, block_size=%d, device=%s).",
+            "AudioOutput: opening stream (requested_sample_rate=%d, channels=%d, block_size=%d, device=%s, name=%s).",
             self.input_sample_rate,
             self.channels,
             self.block_size,
             device if device is not None else "default",
+            (dev_info or {}).get("name"),
         )
 
         try:

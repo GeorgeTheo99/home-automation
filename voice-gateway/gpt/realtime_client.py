@@ -96,7 +96,7 @@ class RealtimeClient:
             open_timeout=open_timeout,
         )
         await self._send_session_update()
-        logging.info("Realtime: connected.")
+        logging.info("Realtime: handshake successful.")
 
     def _schedule_background_connect(self) -> None:
         # Schedule a background connect attempt if not already scheduled/connected.
@@ -153,6 +153,26 @@ class RealtimeClient:
             self._loop,
         )
         return future.result()
+
+    def request_shutdown(self) -> None:
+        """Initiate a best-effort shutdown of any in-flight realtime activity."""
+        if self._closed:
+            return
+
+        if self._bg_connect_future is not None and not self._bg_connect_future.done():
+            self._bg_connect_future.cancel()
+
+        async def _close_ws() -> None:
+            if self._ws is not None:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_close_ws(), self._loop)
+        except RuntimeError:
+            pass
 
     async def _send_utterance_async(
         self,
@@ -225,6 +245,8 @@ class RealtimeClient:
         tool_results: List[Dict[str, Any]] = []
         response_id: Optional[str] = None
 
+        logger = logging.getLogger(__name__)
+
         while True:
             try:
                 raw = await self._recv_event()
@@ -236,17 +258,39 @@ class RealtimeClient:
             if event_type is None:
                 continue
 
+            if logger.isEnabledFor(logging.DEBUG):
+                if event_type in {"response.output_audio.delta", "response.audio.delta"}:
+                    audio_field = event.get("audio") or event.get("delta") or event.get("chunk")
+                    logger.debug(
+                        "Realtime event: %s (audio payload size=%s)",
+                        event_type,
+                        len(audio_field) if isinstance(audio_field, (bytes, str)) else "complex",
+                    )
+                else:
+                    logger.debug("Realtime event: %s", event_type)
+
             if "response_id" in event:
                 response_id = event.get("response_id") or response_id
 
             if event_type in {"response.output_text.delta", "response.text.delta"}:
                 delta = event.get("delta") or event.get("text")
                 text_fragments.extend(self._extract_text(delta))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("Realtime text delta: %s", delta)
             elif event_type in {"response.output_text.done", "response.text.done"}:
                 delta = event.get("text") or event.get("output")
                 text_fragments.extend(self._extract_text(delta))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("Realtime text done: %s", delta)
             elif event_type in {"response.output_audio.delta", "response.audio.delta"}:
-                for chunk in self._extract_audio(event):
+                chunks = list(self._extract_audio(event))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Realtime audio delta: %d chunk(s) (sizes=%s)",
+                        len(chunks),
+                        [chunk.size for chunk in chunks],
+                    )
+                for chunk in chunks:
                     audio_consumer(chunk)
             elif event_type == "response.output_item.added":
                 item = event.get("item") or {}

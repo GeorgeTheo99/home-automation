@@ -6,8 +6,8 @@ import logging
 import queue
 import time
 from dataclasses import dataclass
-import threading
-from typing import Optional
+import os
+from typing import Optional, List
 
 import numpy as np
 import sounddevice as sd
@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 
 class AudioInputError(RuntimeError):
     """Raised when microphone capture cannot be initialised."""
+
+
+def _preferred_name_list(env_var: str, defaults: List[str]) -> List[str]:
+    raw = os.getenv(env_var, "")
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()] if raw else []
+    if not parts:
+        parts = defaults
+    return parts
 
 
 def _resolve_device(device_name: Optional[str], device_index: Optional[int]) -> Optional[int]:
@@ -33,6 +41,18 @@ def _resolve_device(device_name: Optional[str], device_index: Optional[int]) -> 
         return None
     name_lower = device_name.strip().lower()
     if name_lower in {"pipewire", "pulse", "pulseaudio", "default", "auto"}:
+        # Heuristic: prefer known good input devices if available (e.g., ReSpeaker).
+        try:
+            prefs = _preferred_name_list("MIC_PREFERRED_NAMES", ["respeaker", "mic array", "microphone"])
+            for index, info in enumerate(sd.query_devices()):
+                if info.get("max_input_channels", 0) <= 0:
+                    continue
+                devname = str(info.get("name", "")).lower()
+                if any(p in devname for p in prefs):
+                    logger.info("AudioInput: auto-selecting input device %s (index=%s) via preferred names %s.", info.get("name"), index, prefs)
+                    return index
+        except Exception:
+            pass
         return None
     for index, info in enumerate(sd.query_devices()):
         if info.get("max_input_channels", 0) <= 0:
@@ -71,13 +91,19 @@ class AudioInput:
                     device = default_in
             except Exception:
                 pass
+        dev_info = None
+        try:
+            dev_info = sd.query_devices(device, kind="input")
+        except Exception:
+            dev_info = None
         logger.info(
-            "AudioInput: opening stream (sample_rate=%d, channels=%d, target_block_size=%d, device=%s, defaults=%s).",
+            "AudioInput: opening stream (sample_rate=%d, channels=%d, target_block_size=%d, device=%s, defaults=%s, name=%s).",
             self.sample_rate,
             self.channels,
             self.block_size,
             device if device is not None else "default",
             defaults,
+            (dev_info or {}).get("name"),
         )
 
         def _callback(indata, frames, time_info, status) -> None:
@@ -85,11 +111,13 @@ class AudioInput:
                 return
             if status:
                 logger.debug("AudioInput stream status: %s", status)
-            if not indata:
+            if frames <= 0:
+                return
+            if indata is None or indata.size == 0:
                 return
             try:
                 # Copy the frame bytes before handing to the queue; PortAudio reuses the buffer.
-                chunk = bytes(indata)
+                chunk = indata.tobytes()
             except Exception:
                 return
             try:
@@ -104,35 +132,20 @@ class AudioInput:
                     self._queue.put_nowait(chunk)
                 except queue.Full:
                     logger.debug("Dropping audio input chunk due to full buffer.")
-        def _call_with_timeout(fn, timeout_sec: float, *args, **kwargs):
-            holder: dict = {}
-            def _runner():
-                try:
-                    holder["result"] = fn(*args, **kwargs)
-                except BaseException as e:  # propagate any error
-                    holder["error"] = e
-            t = threading.Thread(target=_runner, daemon=True)
-            t.start()
-            t.join(timeout_sec)
-            if t.is_alive():
-                raise TimeoutError(f"operation timed out after {timeout_sec:.1f}s")
-            if "error" in holder:
-                raise holder["error"]
-            return holder.get("result")
-
         try:
-            logger.info("AudioInput: validating input settings (device=%s, rate=%s, channels=%s).", device, self.sample_rate, self.channels)
-            _call_with_timeout(
-                sd.check_input_settings,
-                2.5,
+            logger.info(
+                "AudioInput: validating input settings (device=%s, rate=%s, channels=%s).",
+                device,
+                self.sample_rate,
+                self.channels,
+            )
+            sd.check_input_settings(
                 device=device,
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 dtype="int16",
             )
             logger.info("AudioInput: device settings validated.")
-        except TimeoutError:
-            logger.warning("AudioInput: validation timed out; proceeding without check.")
         except Exception as exc:
             raise AudioInputError(f"Input device rejected settings: {exc}") from exc
 
@@ -144,9 +157,7 @@ class AudioInput:
 
         try:
             logger.info("AudioInput: creating input stream…")
-            self._stream = _call_with_timeout(
-                sd.InputStream,
-                3.0,
+            self._stream = sd.InputStream(
                 samplerate=float(self.sample_rate),
                 channels=self.channels,
                 dtype="int16",
@@ -157,18 +168,13 @@ class AudioInput:
                 callback=_callback,
             )
             logger.info("AudioInput: input stream object created; starting…")
-            _call_with_timeout(self._stream.start, 2.0)
+            self._stream.start()
             actual_blocksize = getattr(self._stream, "blocksize", None)
             logger.info(
                 "AudioInput: stream started (blocksize=%s, device=%s).",
                 actual_blocksize,
                 device if device is not None else "default",
             )
-        except TimeoutError as exc:
-            raise AudioInputError(
-                "Timed out while opening microphone stream. Specify MIC_DEVICE_NAME or MIC_DEVICE_INDEX, "
-                "or try a different backend device (e.g., 'pulse')."
-            ) from exc
         except Exception as exc:
             raise AudioInputError(f"Failed to open input stream: {exc}") from exc
 

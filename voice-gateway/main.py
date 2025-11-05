@@ -1,4 +1,5 @@
 import logging
+import os
 import signal
 import sys
 import time
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 from audio.input import AudioInput, AudioInputError
 from audio.output import AudioOutput, AudioOutputError
 from config import AppConfig, load_config
+from utils.single_instance import obtain_lock, SingleInstanceError
 from gpt.realtime_client import RealtimeClient, RealtimeError
 from tools.home_assistant import HomeAssistantClient
 from tools.registry import ToolRegistry
@@ -142,6 +144,15 @@ def main() -> None:
         config.audio_output.device_name or config.audio_output.device_index,
     )
 
+    # Ensure single-instance so we don't open multiple audio streams accidentally.
+    try:
+        lock_file = config.paths.log_dir / "voice_gateway.pid"
+        app_lock = obtain_lock(lock_file)
+        logging.info("Instance lock acquired at %s (pid=%s).", lock_file, str(app_lock.fd))
+    except SingleInstanceError as exc:
+        logging.error(str(exc))
+        sys.exit(1)
+
     logging.info("Initialising wake detector...")
     wake_detector = VoskWakeWordDetector(
         model_path=str(config.wake.model_path),
@@ -220,17 +231,77 @@ def main() -> None:
             audio_output.write(chunk)
 
     running = True
+    shutdown_initiated = False
+
+    def _force_exit(reason: str) -> None:
+        """Immediately close resources, release lock, and exit the process.
+
+        This is used for Ctrl+Z (SIGTSTP) where the process may be stopped
+        before Python can unwind to the main loop's finally block.
+        """
+        try:
+            logging.info("Force shutdown: %s", reason)
+        except Exception:
+            pass
+        try:
+            realtime_client.request_shutdown()
+        except Exception:
+            pass
+        try:
+            realtime_client.close()
+        except Exception:
+            pass
+        try:
+            wake_detector.close()
+        except Exception:
+            pass
+        try:
+            audio_output.close()
+        except Exception:
+            pass
+        try:
+            audio_input.close()
+        except Exception:
+            pass
+        try:
+            app_lock.release()
+        except Exception:
+            pass
+        # Exit without running further cleanup to avoid re-stops
+        os._exit(0)
+
+    def _request_shutdown(signum: int, *, reason: Optional[str] = None) -> None:
+        nonlocal running, shutdown_initiated
+        if shutdown_initiated:
+            return
+        shutdown_initiated = True
+        message = reason or f"Received signal {signum}; shutting down gracefully."
+        logging.info(message)
+        running = False
+        try:
+            realtime_client.request_shutdown()
+        except Exception:
+            pass
 
     def _handle_signal(signum, frame) -> None:
-        nonlocal running
-        if running:
-            logging.info("Received signal %s; shutting down gracefully.", signum)
-        # Only flip the flag here; do not perform blocking work in a signal handler.
-        # Cleanup runs in the 'finally' block below.
-        running = False
+        _request_shutdown(signum)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _handle_signal)
+
+    def _handle_stop_signal(signum, frame) -> None:
+        # Resume the process group in case it was auto-stopped, then force exit.
+        try:
+            if hasattr(os, "killpg") and hasattr(signal, "SIGCONT"):
+                os.killpg(os.getpgid(os.getpid()), signal.SIGCONT)
+        except Exception:
+            pass
+        _force_exit(f"Received terminal stop signal ({signum})")
+
+    if hasattr(signal, "SIGTSTP"):
+        signal.signal(signal.SIGTSTP, _handle_stop_signal)
 
     block_size = wake_detector.frame_length
     max_capture_sec = max(config.vad.max_segment_ms / 1000.0, 1.0)
@@ -348,6 +419,11 @@ def main() -> None:
             pass
         try:
             audio_input.close()
+        except Exception:
+            pass
+        try:
+            # Release instance lock last.
+            app_lock.release()
         except Exception:
             pass
         logging.info("Shutdown complete.")
