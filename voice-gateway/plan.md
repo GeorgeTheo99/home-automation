@@ -32,7 +32,7 @@ Multi‑Turn Follow‑up Policy (Final)
   - Else: arm a short passive follow-up window (`FOLLOWUP_INFO_WINDOW_SEC`, default 2.5 s) to catch quick add-ons.
   - Use VAD gating with conservative thresholds; if no speech arrives, end quietly.
 - Implementation
-  - In `main.py` STREAM state, after receiving `RealtimeResponse`:
+  - In `pipeline/controller.py` STREAM state (within `PipelineController`), after receiving `RealtimeResponse`:
     - Detect action completion via tool results; if completed and no question, chime → return to WAIT_WAKE.
     - Otherwise set `followup_deadline` based on `asked_question(response.text)` (full vs short window) and transition to FOLLOWUP_ARMED.
   - Keep `FOLLOWUP_GUARD_MS` delay post-playback before listening; in FOLLOWUP_ARMED, capture via VAD; on timeout/no speech → WAIT_WAKE.
@@ -43,7 +43,9 @@ Multi‑Turn Follow‑up Policy (Final)
   - `FOLLOWUP_WINDOW_SEC` (question): 6.0; `FOLLOWUP_INFO_WINDOW_SEC` (informational): 2.5; `FOLLOWUP_GUARD_MS`: 400.
 
 High-Level Architecture
-- main.py: Orchestrator and state machine runner.
+- main.py: Thin entrypoint for config, dependency wiring, signals, and cleanup.
+- pipeline/controller.py: Orchestrator and state machine runner (wake → capture → stream → follow-up).
+- pipeline/capture.py: VAD-driven utterance capture helper used by the controller.
 - config.py: Centralized env parsing and typed configuration.
 - audio/
   - input.py: Mic capture at 16 kHz, mono, PCM16. Provides a blocking reader with gain and device selection.
@@ -59,8 +61,10 @@ High-Level Architecture
   - home_assistant.py: REST client (call_service).
   - weather.py: Lightweight weather lookup (e.g., wttr.in), used by the weather tool.
 
-File Layout
-- main.py (orchestrator)
+- File Layout
+- main.py (entrypoint: wiring + signals)
+- pipeline/controller.py (state machine)
+- pipeline/capture.py (utterance capture)
 - config.py
 - audio/input.py
 - audio/output.py
@@ -70,8 +74,8 @@ File Layout
 - tools/registry.py
 - tools/home_assistant.py
 - tools/weather.py
-- requirements.txt (updated)
-- README.md (update later)
+- requirements.txt
+- README.md
 - plan.md (this file)
 
 External Dependencies

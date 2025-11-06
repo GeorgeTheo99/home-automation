@@ -2,9 +2,7 @@ import logging
 import os
 import signal
 import sys
-import time
-from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Optional
 
 import numpy as np
 from dotenv import load_dotenv
@@ -13,19 +11,13 @@ from audio.input import AudioInput, AudioInputError
 from audio.output import AudioOutput, AudioOutputError
 from config import AppConfig, load_config
 from utils.single_instance import obtain_lock, SingleInstanceError
-from gpt.realtime_client import RealtimeClient, RealtimeError
+from gpt.realtime_client import RealtimeClient
 from tools.home_assistant import HomeAssistantClient
 from tools.registry import ToolRegistry
 from tools.weather import WeatherClient
 from vad.silero import VoiceActivityDetector
 from wake.vosk import VoskWakeWordDetector
-
-
-class GatewayState(Enum):
-    WAIT_WAKE = auto()
-    CAPTURE = auto()
-    STREAM = auto()
-    FOLLOWUP_ARMED = auto()
+from pipeline import PipelineController
 
 
 def setup_logging() -> None:
@@ -34,96 +26,6 @@ def setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-
-def rms_level(chunk: np.ndarray) -> float:
-    if chunk.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768.0
-
-
-def peak_level(chunk: np.ndarray) -> int:
-    if chunk.size == 0:
-        return 0
-    return int(np.max(np.abs(chunk)))
-
-
-def record_utterance(
-    vad: VoiceActivityDetector,
-    reader: Callable[[int], np.ndarray],
-    block_size: int,
-    listen_timeout: Optional[float],
-    max_capture_sec: float,
-    min_peak: Optional[int] = None,
-    min_rms: Optional[float] = None,
-    should_stop: Optional[Callable[[], bool]] = None,
-) -> Optional[np.ndarray]:
-    vad.reset()
-    captured: List[np.ndarray] = []
-    speech_detected = False
-    start_time = time.monotonic()
-    listen_deadline = start_time + listen_timeout if listen_timeout is not None else None
-    end_deadline = start_time + max_capture_sec
-
-    while time.monotonic() < end_deadline:
-        if should_stop is not None and should_stop():
-            logging.debug("record_utterance: stop requested externally.")
-            return None
-        chunk = reader(block_size)
-        if chunk.size == 0:
-            if should_stop is not None and should_stop():
-                logging.debug("record_utterance: received empty chunk and stop requested.")
-                return None
-            continue
-        captured.append(chunk)
-        result = vad.process(chunk)
-        if result.speech_started:
-            logging.info(
-                "VAD speech started (prob=%.2f, rms=%.4f, peak=%d).",
-                result.probability,
-                rms_level(chunk),
-                peak_level(chunk),
-            )
-        if result.speech_ended or result.forced:
-            logging.info(
-                "VAD speech ended (duration_ms=%.0f, silence_ms=%.0f, forced=%s).",
-                result.speech_duration_ms,
-                result.silence_duration_ms,
-                result.forced,
-            )
-
-        if not speech_detected:
-            if listen_deadline is not None and time.monotonic() > listen_deadline:
-                logging.info("VAD listen timeout reached before speech start.")
-                return None
-            if result.speech_started:
-                meets_peak = min_peak is None or peak_level(chunk) >= min_peak
-                meets_rms = min_rms is None or rms_level(chunk) >= min_rms
-                if meets_peak and meets_rms:
-                    speech_detected = True
-                else:
-                    captured.clear()
-                    vad.reset()
-                    continue
-        else:
-            if result.speech_ended or result.forced:
-                break
-    if not speech_detected:
-        logging.info("record_utterance: no speech detected.")
-        return None
-    if not captured:
-        logging.debug("record_utterance: speech detected but no audio captured.")
-        return None
-    return np.concatenate(captured)
-
-
-def should_arm_followup(response_text: str, config: AppConfig) -> bool:
-    follow_up = config.follow_up
-    if not follow_up.enabled:
-        return False
-    if follow_up.arm_mode == "always":
-        return True
-    return response_text.strip().endswith("?")
 
 
 def main() -> None:
@@ -228,9 +130,20 @@ def main() -> None:
 
     def playback(chunk: np.ndarray) -> None:
         if chunk.size:
+            logging.debug("Playback: received audio chunk (%d samples)", chunk.size)
             audio_output.write(chunk)
+        else:
+            logging.debug("Playback: received empty chunk")
 
-    running = True
+    controller = PipelineController(
+        config=config,
+        audio_input=audio_input,
+        wake_detector=wake_detector,
+        vad=vad,
+        realtime_client=realtime_client,
+        playback=playback,
+    )
+
     shutdown_initiated = False
 
     def _force_exit(reason: str) -> None:
@@ -241,6 +154,10 @@ def main() -> None:
         """
         try:
             logging.info("Force shutdown: %s", reason)
+        except Exception:
+            pass
+        try:
+            controller.request_shutdown()
         except Exception:
             pass
         try:
@@ -271,13 +188,16 @@ def main() -> None:
         os._exit(0)
 
     def _request_shutdown(signum: int, *, reason: Optional[str] = None) -> None:
-        nonlocal running, shutdown_initiated
+        nonlocal shutdown_initiated
         if shutdown_initiated:
             return
         shutdown_initiated = True
         message = reason or f"Received signal {signum}; shutting down gracefully."
         logging.info(message)
-        running = False
+        try:
+            controller.request_shutdown()
+        except Exception:
+            pass
         try:
             realtime_client.request_shutdown()
         except Exception:
@@ -303,108 +223,13 @@ def main() -> None:
     if hasattr(signal, "SIGTSTP"):
         signal.signal(signal.SIGTSTP, _handle_stop_signal)
 
-    block_size = wake_detector.frame_length
-    max_capture_sec = max(config.vad.max_segment_ms / 1000.0, 1.0)
-
-    state = GatewayState.WAIT_WAKE
-    pending_audio: Optional[np.ndarray] = None
-    followup_deadline: Optional[float] = None
-
-    logging.info("Voice gateway ready. Say the wake word to begin.")
-
     try:
-        while running:
-            if state == GatewayState.WAIT_WAKE:
-                chunk = audio_input.read(block_size)
-                if wake_detector.process(chunk):
-                    logging.info("Wake word detected.")
-                    state = GatewayState.CAPTURE
-                    vad.reset()
-                    audio_input.flush()
-                    continue
-            elif state == GatewayState.CAPTURE:
-                utterance = record_utterance(
-                    vad=vad,
-                    reader=lambda frames: audio_input.read(frames),
-                    block_size=block_size,
-                    listen_timeout=None,
-                    max_capture_sec=max_capture_sec,
-                    should_stop=lambda: not running,
-                )
-                if utterance is None:
-                    logging.info("No speech detected after wake word.")
-                    audio_input.flush()
-                    state = GatewayState.WAIT_WAKE
-                    continue
-                pending_audio = utterance
-                state = GatewayState.STREAM
-            elif state == GatewayState.STREAM:
-                if pending_audio is None or pending_audio.size == 0:
-                    state = GatewayState.WAIT_WAKE
-                    continue
-                logging.info("Streaming utterance to realtime API (%d samples).", pending_audio.size)
-                try:
-                    response = realtime_client.send_utterance(
-                        pcm16_audio=pending_audio,
-                        source_sample_rate=config.audio_input.sample_rate,
-                        audio_consumer=playback,
-                    )
-                except RealtimeError as exc:
-                    logging.error("Realtime processing failed: %s", exc)
-                    audio_input.flush()
-                    state = GatewayState.WAIT_WAKE
-                    continue
-
-                if response.text:
-                    logging.info("Assistant: %s", response.text)
-                else:
-                    logging.info("Assistant response completed.")
-
-                pending_audio = None
-                followup_required = should_arm_followup(response.text, config)
-                if followup_required:
-                    followup_window = config.follow_up.window_sec
-                    followup_deadline = time.monotonic() + followup_window
-                    guard_delay = max(0.0, config.follow_up.guard_ms / 1000.0)
-                    if guard_delay:
-                        time.sleep(guard_delay)
-                    vad.reset()
-                    logging.info(
-                        "Follow-up window armed for %.1fs (guard=%.0f ms).",
-                        followup_window,
-                        config.follow_up.guard_ms,
-                    )
-                    state = GatewayState.FOLLOWUP_ARMED
-                else:
-                    audio_input.flush()
-                    state = GatewayState.WAIT_WAKE
-            elif state == GatewayState.FOLLOWUP_ARMED:
-                if followup_deadline is None or time.monotonic() > followup_deadline:
-                    logging.info("Follow-up window expired.")
-                    audio_input.flush()
-                    state = GatewayState.WAIT_WAKE
-                    continue
-
-                remaining = followup_deadline - time.monotonic()
-                utterance = record_utterance(
-                    vad=vad,
-                    reader=lambda frames: audio_input.read(frames),
-                    block_size=block_size,
-                    listen_timeout=remaining,
-                    max_capture_sec=max_capture_sec,
-                    min_peak=config.follow_up.min_peak,
-                    min_rms=config.follow_up.min_rms,
-                    should_stop=lambda: not running,
-                )
-                if utterance is None:
-                    audio_input.flush()
-                    state = GatewayState.WAIT_WAKE
-                    continue
-                pending_audio = utterance
-                state = GatewayState.STREAM
-            else:
-                state = GatewayState.WAIT_WAKE
+        controller.run()
     finally:
+        try:
+            controller.request_shutdown()
+        except Exception:
+            pass
         try:
             realtime_client.close()
         except Exception:

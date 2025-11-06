@@ -35,14 +35,26 @@ def _resolve_device(device_name: Optional[str], device_index: Optional[int]) -> 
     if name_lower in {"pipewire", "pulse", "pulseaudio", "default", "auto"}:
         # Heuristic: prefer known good output devices if available (e.g., Edifier).
         try:
-            prefs = _preferred_name_list("SPEAKER_PREFERRED_NAMES", ["edifier", "speaker", "usb audio", "r19u"]) 
+            prefs = _preferred_name_list("SPEAKER_PREFERRED_NAMES", ["edifier", "r19u", "speaker"])
+            # Match devices and score by specificity (prefer exact matches over generic terms)
+            candidates = []
             for index, info in enumerate(sd.query_devices()):
                 if info.get("max_output_channels", 0) <= 0:
                     continue
                 devname = str(info.get("name", "")).lower()
-                if any(p in devname for p in prefs):
-                    logger.info("AudioOutput: auto-selecting output device %s (index=%s) via preferred names %s.", info.get("name"), index, prefs)
-                    return index
+                for pref_idx, pref in enumerate(prefs):
+                    if pref in devname:
+                        # Score: lower is better (prefer earlier prefs, avoid generic "usb audio")
+                        score = pref_idx if pref not in {"usb audio", "speaker"} else pref_idx + 100
+                        candidates.append((score, index, info.get("name")))
+                        break
+
+            if candidates:
+                # Pick the best (lowest score)
+                candidates.sort()
+                _, best_index, best_name = candidates[0]
+                logger.info("AudioOutput: auto-selecting output device %s (index=%s) via preferred names %s.", best_name, best_index, prefs)
+                return best_index
         except Exception:
             pass
         return None
@@ -163,8 +175,17 @@ class AudioOutput:
             return
         if pcm16.dtype != np.int16:
             pcm16 = np.clip(pcm16.astype(np.float32), -32768, 32767).astype(np.int16)
+        original_size = pcm16.size
         if self.sample_rate != self.input_sample_rate:
             pcm16 = self._resample_linear(pcm16, self.input_sample_rate, self.sample_rate)
+            logger.debug(
+                "AudioOutput: resampled %d→%d Hz (%d samples → %d samples)",
+                self.input_sample_rate,
+                self.sample_rate,
+                original_size,
+                pcm16.size,
+            )
+        logger.debug("AudioOutput: writing %d samples to device", pcm16.size)
         self._stream.write(pcm16.tobytes())
 
     def close(self) -> None:

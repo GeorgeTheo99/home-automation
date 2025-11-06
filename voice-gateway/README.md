@@ -104,13 +104,15 @@ The tool registry validates arguments and raises descriptive errors if Home Assi
 ## Project Structure
 
 ```
-config.py                 # environment parsing
-main.py                   # state machine orchestrator
-audio/                    # microphone and speaker abstractions
-wake/vosk.py              # wake word detector
-vad/silero.py             # streaming VAD + endpointing
-gpt/realtime_client.py    # OpenAI Realtime websocket client
-tools/                    # Home Assistant + weather tools
+config.py                   # environment parsing
+main.py                     # thin entrypoint: config + wiring + signals
+pipeline/controller.py      # pipeline finite-state machine (wake → capture → stream → follow-up)
+pipeline/capture.py         # VAD-driven utterance capture helper
+audio/                      # microphone and speaker abstractions
+wake/vosk.py                # wake word detector
+vad/silero.py               # streaming VAD + endpointing
+gpt/realtime_client.py      # OpenAI Realtime websocket client
+tools/                      # Home Assistant + weather tools
 ```
 
-Logs (INFO level) show state transitions, tool results, and assistant summaries. Enable more detailed diagnostics by editing `main.py` to raise the logging level if needed.
+Logs (INFO level) show state transitions, tool results, and assistant summaries. For more detailed diagnostics, adjust logging in `main.py` (or within `pipeline/controller.py`).

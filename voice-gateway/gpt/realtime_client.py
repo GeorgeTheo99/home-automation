@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import threading
 from dataclasses import dataclass, field
@@ -116,15 +117,26 @@ class RealtimeClient:
     async def _send_session_update(self) -> None:
         if self._ws is None:
             raise RealtimeError("Realtime websocket is not connected.")
+        session_config = {
+            "modalities": self._config.modalities,
+            "temperature": self._config.temperature,
+            "instructions": self._config.instructions_prompt,
+            "tools": self._tool_registry.schemas(),
+            "turn_detection": None,  # Manual turn control (no server-side VAD)
+        }
+        # Only set audio-specific params if audio modality is enabled
+        if "audio" in self._config.modalities:
+            session_config["voice"] = "alloy"  # Default voice
+            session_config["input_audio_format"] = "pcm16"
+            session_config["output_audio_format"] = self._output_audio_format
+            session_config["input_audio_transcription"] = {"model": "whisper-1"}
+
         payload = {
             "type": "session.update",
-            "session": {
-                "modalities": self._config.modalities,
-                "temperature": self._config.temperature,
-                "instructions": self._config.instructions_prompt,
-                "tools": self._tool_registry.schemas(),
-            },
+            "session": session_config,
         }
+        logging.info("Realtime: sending session.update with modalities=%s, audio=%s",
+                    self._config.modalities, "audio" in self._config.modalities)
         await self._ws.send(json.dumps(payload))
 
     def close(self) -> None:
@@ -139,7 +151,11 @@ class RealtimeClient:
             self._loop.stop()
 
         future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
-        future.result()
+        try:
+            future.result(timeout=2.0)
+        except (concurrent.futures.TimeoutError, Exception):
+            # Force stop if graceful shutdown times out
+            self._loop.stop()
         self._loop_thread.join(timeout=1.0)
 
     def send_utterance(
@@ -152,7 +168,14 @@ class RealtimeClient:
             self._send_utterance_async(pcm16_audio, source_sample_rate, audio_consumer),
             self._loop,
         )
-        return future.result()
+        # Poll with timeout to allow signal handlers (Ctrl+C) to run
+        while True:
+            try:
+                return future.result(timeout=0.5)
+            except concurrent.futures.TimeoutError:
+                if self._closed:
+                    raise RealtimeError("Realtime client was closed during operation")
+                continue
 
     def request_shutdown(self) -> None:
         """Initiate a best-effort shutdown of any in-flight realtime activity."""
@@ -186,6 +209,23 @@ class RealtimeClient:
         async with self._lock:
             resampled = resample_linear(pcm16_audio.astype(np.int16), source_sample_rate, self._output_sample_rate)
             duration = pcm16_audio.size / float(source_sample_rate) if source_sample_rate else 0.0
+
+            # Debug: Save audio to file for inspection (optional)
+            import os
+            if os.getenv("DEBUG_SAVE_AUDIO") == "true":
+                import wave
+                import time as time_mod
+                debug_path = f"logs/debug_audio_{int(time_mod.time())}.wav"
+                try:
+                    with wave.open(debug_path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)  # 16-bit
+                        wf.setframerate(self._output_sample_rate)
+                        wf.writeframes(resampled.tobytes())
+                    logging.info("Debug: saved audio to %s", debug_path)
+                except Exception as e:
+                    logging.warning("Debug: failed to save audio: %s", e)
+
             logging.info(
                 "Realtime: streaming utterance (duration=%.2fs, input_samples=%d -> output_samples=%d).",
                 duration,
@@ -244,6 +284,7 @@ class RealtimeClient:
         tool_buffers: Dict[str, Dict[str, Any]] = {}
         tool_results: List[Dict[str, Any]] = []
         response_id: Optional[str] = None
+        audio_chunks_received = 0
 
         logger = logging.getLogger(__name__)
 
@@ -258,16 +299,26 @@ class RealtimeClient:
             if event_type is None:
                 continue
 
-            if logger.isEnabledFor(logging.DEBUG):
-                if event_type in {"response.output_audio.delta", "response.audio.delta"}:
-                    audio_field = event.get("audio") or event.get("delta") or event.get("chunk")
-                    logger.debug(
-                        "Realtime event: %s (audio payload size=%s)",
-                        event_type,
-                        len(audio_field) if isinstance(audio_field, (bytes, str)) else "complex",
-                    )
-                else:
-                    logger.debug("Realtime event: %s", event_type)
+            # Log ALL events to diagnose why OpenAI isn't responding
+            if event_type in {"response.output_audio.delta", "response.audio.delta"}:
+                audio_field = event.get("audio") or event.get("delta") or event.get("chunk")
+                logger.info(
+                    "Realtime event: %s (audio payload size=%s)",
+                    event_type,
+                    len(audio_field) if isinstance(audio_field, (bytes, str)) else "complex",
+                )
+            elif event_type in {"response.done", "response.completed"}:
+                logger.info("Realtime event: %s", event_type)
+            elif event_type == "error":
+                logger.error("Realtime event: ERROR - %s", event.get("error", {}))
+            elif event_type == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript", "")
+                logger.info("Realtime: input audio transcribed: '%s'", transcript)
+            elif event_type == "conversation.item.input_audio_transcription.failed":
+                error_msg = event.get("error", {}).get("message", "unknown")
+                logger.error("Realtime: input audio transcription FAILED: %s", error_msg)
+            else:
+                logger.info("Realtime event: %s", event_type)
 
             if "response_id" in event:
                 response_id = event.get("response_id") or response_id
@@ -278,20 +329,25 @@ class RealtimeClient:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug("Realtime text delta: %s", delta)
             elif event_type in {"response.output_text.done", "response.text.done"}:
-                delta = event.get("text") or event.get("output")
-                text_fragments.extend(self._extract_text(delta))
+                # Skip done events - we've already accumulated all deltas.
+                # The done event contains the full text, not just remaining text,
+                # so accumulating it would duplicate everything.
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("Realtime text done: %s", delta)
+                    final_text = event.get("text") or event.get("output")
+                    logger.debug("Realtime text done: %s", final_text)
             elif event_type in {"response.output_audio.delta", "response.audio.delta"}:
                 chunks = list(self._extract_audio(event))
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Realtime audio delta: %d chunk(s) (sizes=%s)",
-                        len(chunks),
-                        [chunk.size for chunk in chunks],
-                    )
-                for chunk in chunks:
-                    audio_consumer(chunk)
+                if chunks:
+                    audio_chunks_received += len(chunks)
+                    total_samples = sum(chunk.size for chunk in chunks)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Realtime audio delta: %d chunk(s) (sizes=%s)",
+                            len(chunks),
+                            [chunk.size for chunk in chunks],
+                        )
+                    for chunk in chunks:
+                        audio_consumer(chunk)
             elif event_type == "response.output_item.added":
                 item = event.get("item") or {}
                 if item.get("type") == "function_call":
@@ -339,7 +395,14 @@ class RealtimeClient:
             else:
                 logging.debug("Unhandled realtime event: %s", event_type)
 
-        return RealtimeResponse(text="".join(text_fragments).strip(), tool_results=tool_results, response_id=response_id)
+        final_text = "".join(text_fragments).strip()
+        if audio_chunks_received > 0:
+            logging.info("Realtime: response complete (text_len=%d, audio_chunks=%d, tools=%d)",
+                        len(final_text), audio_chunks_received, len(tool_results))
+        else:
+            logging.warning("Realtime: response complete but NO AUDIO RECEIVED (text_len=%d, tools=%d)",
+                          len(final_text), len(tool_results))
+        return RealtimeResponse(text=final_text, tool_results=tool_results, response_id=response_id)
 
     def _extract_text(self, payload: Any) -> List[str]:
         fragments: List[str] = []
