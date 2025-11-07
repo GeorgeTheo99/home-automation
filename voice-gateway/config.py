@@ -88,6 +88,7 @@ class FollowUpConfig:
     enabled: bool
     arm_mode: str
     window_sec: float
+    window_normal_sec: float
     guard_ms: float
     min_rms: Optional[float]
     min_peak: Optional[int]
@@ -185,8 +186,11 @@ class AppConfig:
 
 
 INSTRUCTIONS_PROMPT = (
-    "You are a helpful, concise home assistant. Speak succinctly. Use tools when appropriate to "
-    "control the home or fetch weather. If you need more information, ask a direct question. "
+    "You are a helpful, concise home assistant. Always respond in English. Speak succinctly. "
+    "Use tools when appropriate to control the home or fetch weather. "
+    "If you don't understand the user's input or cannot help, call the signal_confusion tool "
+    "immediately instead of speaking - do not provide a verbal response. "
+    "If you need more information, ask a direct question. "
     "The system will allow a brief follow-up window after your response; otherwise the user must "
     "say the wake word again."
 )
@@ -201,7 +205,7 @@ def load_config() -> AppConfig:
     if not realtime_modalities:
         realtime_modalities = ["audio"]
 
-    wake_model_raw = _get_env("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15") or "models/vosk-model-small-en-us-0.15"
+    wake_model_raw = _get_env("VOSK_MODEL_PATH", "models/vosk-model-en-us-0.22-lgraph") or "models/vosk-model-en-us-0.22-lgraph"
     wake_phrases_raw = _get_env("WAKEWORD_PHRASES", "hey computer") or "hey computer"
     vad_model_raw = _get_env("VAD_MODEL_PATH", "models/silero_vad.jit") or "models/silero_vad.jit"
 
@@ -211,7 +215,7 @@ def load_config() -> AppConfig:
             # Default to pinned latest Realtime model (verified via /v1/models)
             model=_get_env("REALTIME_MODEL", "gpt-realtime-2025-08-28") or "gpt-realtime-2025-08-28",
             modalities=realtime_modalities,
-            temperature=_get_float("REALTIME_TEMPERATURE", 0.2),
+            temperature=_get_float("REALTIME_TEMPERATURE", 0.6),
             connect_timeout=_get_float("REALTIME_CONNECT_TIMEOUT", 8.0),
             session_timeout=_get_float("REALTIME_SESSION_TIMEOUT", 12.0),
             instructions_prompt=_get_env("REALTIME_INSTRUCTIONS_PROMPT", INSTRUCTIONS_PROMPT) or INSTRUCTIONS_PROMPT,
@@ -229,8 +233,9 @@ def load_config() -> AppConfig:
         ),
         follow_up=FollowUpConfig(
             enabled=_get_bool("FOLLOWUP_ENABLED", True),
-            arm_mode=_get_env("FOLLOWUP_ARM_MODE", "question_only") or "question_only",
+            arm_mode=_get_env("FOLLOWUP_ARM_MODE", "always") or "always",
             window_sec=_get_float("FOLLOWUP_WINDOW_SEC", 6.0),
+            window_normal_sec=_get_float("FOLLOWUP_WINDOW_NORMAL_SEC", 3.0),
             guard_ms=_get_float("FOLLOWUP_GUARD_MS", 400.0),
             min_rms=_get_optional_float("FOLLOWUP_MIN_RMS"),
             min_peak=_get_optional_int("FOLLOWUP_MIN_PEAK"),

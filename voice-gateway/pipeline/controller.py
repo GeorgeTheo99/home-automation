@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from enum import Enum, auto
 from typing import Callable, Optional
@@ -50,6 +51,11 @@ class PipelineController:
         self._block_size = self._wake_detector.frame_length
         self._max_capture_sec = max(self._config.vad.max_segment_ms / 1000.0, 1.0)
 
+        # Zero-start-delay configuration
+        self._implicit_start = os.getenv("IMPLICIT_START_ON_WAKE", "true").lower() in {"true", "1", "yes", "on"}
+        self._vad_warm_on_wake = os.getenv("VAD_WARM_ON_WAKE", "true").lower() in {"true", "1", "yes", "on"}
+        self._post_wake_timeout = float(os.getenv("POST_WAKE_TIMEOUT", "3.0"))
+
         self._running = True
         self._state = GatewayState.WAIT_WAKE
         self._pending_audio: Optional[np.ndarray] = None
@@ -66,33 +72,47 @@ class PipelineController:
                 chunk = self._audio_input.read(self._block_size)
                 if self._wake_detector.process(chunk):
                     logger.info("Wake word detected.")
+                    logger.info("🎤 Microphone OPEN (reason: wake word detected)")
+
+                    # Extract pre-roll and drain queue
+                    preroll = self._audio_input.get_preroll()  # Uses default from config
+                    self._audio_input.drain()  # Clear queued audio after extracting pre-roll
+
+                    preroll_ms = (preroll.size * 1000) // self._config.audio_input.sample_rate
+                    logger.info("Captured %d ms pre-roll (%d samples).", preroll_ms, preroll.size)
+
                     self._state = GatewayState.CAPTURE
-                    self._vad.reset()
-                    self._audio_input.flush()
+                    self._preroll_audio = preroll  # Store for use in capture
                     continue
 
             elif self._state == GatewayState.CAPTURE:
+                preroll = getattr(self, "_preroll_audio", None)
+                self._preroll_audio = None  # Clear after reading
+
                 utterance = record_utterance(
                     vad=self._vad,
                     reader=lambda frames: self._audio_input.read(frames),
                     block_size=self._block_size,
-                    listen_timeout=None,
+                    listen_timeout=self._post_wake_timeout,  # Shorter timeout for post-wake silence
                     max_capture_sec=self._max_capture_sec,
                     should_stop=self._should_stop,
+                    reset_vad=not self._vad_warm_on_wake,  # Keep VAD warm if configured
+                    initial_audio=preroll if self._vad_warm_on_wake else None,  # Pass pre-roll if warming enabled
+                    start_on_wake=self._implicit_start,  # Implicit start if configured
                 )
                 if not self._running:
                     break
                 if utterance is None:
                     logger.info("No speech detected after wake word.")
-                    self._audio_input.flush()
-                    self._state = GatewayState.WAIT_WAKE
+                    logger.info("🔇 Microphone CLOSED (reason: no speech detected)")
+                    self._close_mic_and_reset()
                     continue
                 self._pending_audio = utterance
                 self._state = GatewayState.STREAM
 
             elif self._state == GatewayState.STREAM:
                 if self._pending_audio is None or self._pending_audio.size == 0:
-                    self._state = GatewayState.WAIT_WAKE
+                    self._close_mic_and_reset()
                     continue
                 logger.info("Streaming utterance to realtime API (%d samples).", self._pending_audio.size)
                 try:
@@ -103,9 +123,9 @@ class PipelineController:
                     )
                 except RealtimeError as exc:
                     logger.error("Realtime processing failed: %s", exc)
-                    self._audio_input.flush()
+                    logger.info("🔇 Microphone CLOSED (reason: realtime error)")
                     self._pending_audio = None
-                    self._state = GatewayState.WAIT_WAKE
+                    self._close_mic_and_reset()
                     continue
 
                 if response.text:
@@ -114,28 +134,39 @@ class PipelineController:
                     logger.info("Assistant response completed.")
 
                 self._pending_audio = None
-                if self._should_arm_followup(response.text):
-                    followup_window = self._config.follow_up.window_sec
+                # Check if confusion was signaled - if so, don't arm follow-up
+                confusion_signaled = any(
+                    result.get("name") == "signal_confusion"
+                    for result in (response.tool_results or [])
+                )
+                if confusion_signaled:
+                    logger.info("🔇 Microphone CLOSED (reason: confusion signaled, user must re-invoke)")
+                    self._close_mic_and_reset()
+                    continue
+
+                should_arm, followup_window, reason = self._should_arm_followup(response.text)
+                if should_arm:
                     self._followup_deadline = time.monotonic() + followup_window
                     guard_delay = max(0.0, self._config.follow_up.guard_ms / 1000.0)
                     if guard_delay:
                         time.sleep(guard_delay)
                     self._vad.reset()
                     logger.info(
-                        "Follow-up window armed for %.1fs (guard=%.0f ms).",
+                        "🎤 Microphone OPEN (reason: follow-up %s, window=%.1fs, guard=%.0fms)",
+                        reason,
                         followup_window,
                         self._config.follow_up.guard_ms,
                     )
                     self._state = GatewayState.FOLLOWUP_ARMED
                 else:
-                    self._audio_input.flush()
-                    self._state = GatewayState.WAIT_WAKE
+                    logger.info("🔇 Microphone CLOSED (reason: follow-up disabled)")
+                    self._close_mic_and_reset()
 
             elif self._state == GatewayState.FOLLOWUP_ARMED:
                 if self._followup_deadline is None or time.monotonic() > self._followup_deadline:
                     logger.info("Follow-up window expired.")
-                    self._audio_input.flush()
-                    self._state = GatewayState.WAIT_WAKE
+                    logger.info("🔇 Microphone CLOSED (reason: follow-up timeout)")
+                    self._close_mic_and_reset()
                     continue
 
                 remaining = self._followup_deadline - time.monotonic()
@@ -148,18 +179,24 @@ class PipelineController:
                     min_peak=self._config.follow_up.min_peak,
                     min_rms=self._config.follow_up.min_rms,
                     should_stop=self._should_stop,
+                    # Use traditional VAD start detection for follow-up
+                    reset_vad=True,  # Reset for clean follow-up detection
+                    initial_audio=None,
+                    start_on_wake=False,
                 )
                 if not self._running:
                     break
                 if utterance is None:
-                    self._audio_input.flush()
-                    self._state = GatewayState.WAIT_WAKE
+                    logger.info("🔇 Microphone CLOSED (reason: follow-up no speech)")
+                    self._close_mic_and_reset()
                     continue
+                logger.info("Follow-up speech detected, processing utterance.")
                 self._pending_audio = utterance
                 self._state = GatewayState.STREAM
 
             else:
-                self._state = GatewayState.WAIT_WAKE
+                # Unknown state - reset to clean state
+                self._close_mic_and_reset()
 
         # Flush pending audio when stopping to minimise latency on next start.
         self._audio_input.flush()
@@ -167,10 +204,38 @@ class PipelineController:
     def _should_stop(self) -> bool:
         return not self._running
 
-    def _should_arm_followup(self, response_text: str) -> bool:
+    def _close_mic_and_reset(self) -> None:
+        """Close microphone and reset conversation for next wake word interaction.
+
+        This ensures each wake word session starts with a fresh conversation,
+        while follow-up chains maintain context.
+        """
+        self._audio_input.flush()
+        self._vad.reset()
+        self._realtime_client.reset_conversation()
+        self._state = GatewayState.WAIT_WAKE
+
+    def _should_arm_followup(self, response_text: str) -> tuple[bool, float, str]:
+        """Determine if follow-up should be armed and return (should_arm, timeout_seconds, reason).
+
+        Returns:
+            (True, 6.0, "question") if response contains ?
+            (True, 3.0, "normal") for normal responses when enabled
+            (False, 0.0, "disabled") if follow-up is disabled
+        """
         follow_up = self._config.follow_up
         if not follow_up.enabled:
-            return False
-        if follow_up.arm_mode == "always":
-            return True
-        return response_text.strip().endswith("?")
+            return (False, 0.0, "disabled")
+
+        is_question = "?" in response_text
+
+        if follow_up.arm_mode == "question_only":
+            if is_question:
+                return (True, follow_up.window_sec, "question")
+            else:
+                return (False, 0.0, "not a question")
+        else:  # "always" mode
+            if is_question:
+                return (True, follow_up.window_sec, "question")
+            else:
+                return (True, follow_up.window_normal_sec, "normal")

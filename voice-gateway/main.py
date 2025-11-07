@@ -112,6 +112,13 @@ def main() -> None:
     )
     logging.info("Voice activity detector ready.")
 
+    def playback(chunk: np.ndarray) -> None:
+        if chunk.size:
+            logging.debug("Playback: received audio chunk (%d samples)", chunk.size)
+            audio_output.write(chunk)
+        else:
+            logging.debug("Playback: received empty chunk")
+
     ha_client = HomeAssistantClient(
         base_url=config.home_assistant.url,
         token=config.home_assistant.token,
@@ -122,18 +129,15 @@ def main() -> None:
         default_location=config.weather.default_location,
         timeout=config.weather.timeout,
     )
-    tool_registry = ToolRegistry(ha_client=ha_client, weather_client=weather_client)
+    tool_registry = ToolRegistry(
+        ha_client=ha_client,
+        weather_client=weather_client,
+        audio_playback=playback,
+    )
 
     logging.info("Initialising realtime client (%s).", config.realtime.model)
     realtime_client = RealtimeClient(config=config.realtime, tool_registry=tool_registry)
     logging.info("Realtime client initialised.")
-
-    def playback(chunk: np.ndarray) -> None:
-        if chunk.size:
-            logging.debug("Playback: received audio chunk (%d samples)", chunk.size)
-            audio_output.write(chunk)
-        else:
-            logging.debug("Playback: received empty chunk")
 
     controller = PipelineController(
         config=config,

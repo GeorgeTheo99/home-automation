@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import time
 from dataclasses import dataclass
-import os
-from typing import Optional, List
+from typing import List, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -77,6 +77,13 @@ class AudioInput:
         self._queue: "queue.Queue[bytes]" = queue.Queue(maxsize=16)
         self._last_chunk_time = time.monotonic()
         self._last_no_audio_warning = 0.0
+
+        # Ring buffer for pre-roll (e.g., 400ms at 16kHz mono = 6400 samples = 12.8KB)
+        self._preroll_ms = int(os.getenv("PREROLL_MS", "400"))
+        self._preroll_max_samples = (self._preroll_ms * self.sample_rate) // 1000
+        self._ring_buffer: np.ndarray = np.zeros(self._preroll_max_samples, dtype=np.int16)
+        self._ring_write_pos = 0
+
         device = _resolve_device(self.device_name, self.device_index)
         try:
             defaults = sd.default.device
@@ -123,6 +130,19 @@ class AudioInput:
             try:
                 self._queue.put_nowait(chunk)
                 self._last_chunk_time = time.monotonic()
+
+                # Update ring buffer for pre-roll
+                pcm = np.frombuffer(chunk, dtype=np.int16)
+                samples_to_write = min(len(pcm), self._preroll_max_samples)
+                if self._ring_write_pos + samples_to_write <= self._preroll_max_samples:
+                    self._ring_buffer[self._ring_write_pos:self._ring_write_pos + samples_to_write] = pcm[:samples_to_write]
+                    self._ring_write_pos += samples_to_write
+                else:
+                    # Wrap around
+                    first_chunk = self._preroll_max_samples - self._ring_write_pos
+                    self._ring_buffer[self._ring_write_pos:] = pcm[:first_chunk]
+                    self._ring_buffer[:samples_to_write - first_chunk] = pcm[first_chunk:samples_to_write]
+                    self._ring_write_pos = samples_to_write - first_chunk
             except queue.Full:
                 try:
                     self._queue.get_nowait()
@@ -161,10 +181,9 @@ class AudioInput:
                 samplerate=float(self.sample_rate),
                 channels=self.channels,
                 dtype="int16",
-                # Let backend choose native blocksize; we'll repack to requested size in read().
-                blocksize=0,
+                blocksize=self.block_size,  # Explicit blocksize for lower latency
                 device=device,
-                latency="high",
+                latency="low",  # Low latency for faster first frame
                 callback=_callback,
             )
             logger.info("AudioInput: input stream object created; starting…")
@@ -178,7 +197,7 @@ class AudioInput:
         except Exception as exc:
             raise AudioInputError(f"Failed to open input stream: {exc}") from exc
 
-    def read(self, frames: Optional[int] = None, timeout: float = 0.2) -> np.ndarray:
+    def read(self, frames: Optional[int] = None, timeout: float = 0.05) -> np.ndarray:
         """Non-blocking-ish read of PCM16 audio, returning empty array on timeout."""
         if frames is None:
             frames = self.block_size
@@ -227,6 +246,37 @@ class AudioInput:
 
     def flush(self) -> None:
         """Clear any queued audio to reduce latency when restarting capture."""
+        self._pending = b""
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def get_preroll(self, ms: Optional[int] = None) -> np.ndarray:
+        """Extract last N milliseconds from ring buffer without clearing it."""
+        if ms is None:
+            ms = self._preroll_ms
+        num_samples = min((ms * self.sample_rate) // 1000, self._preroll_max_samples)
+        if num_samples == 0:
+            return np.zeros(0, dtype=np.int16)
+
+        # Extract last num_samples in chronological order
+        result = np.zeros(num_samples, dtype=np.int16)
+        start_pos = (self._ring_write_pos - num_samples) % self._preroll_max_samples
+
+        if start_pos + num_samples <= self._preroll_max_samples:
+            result[:] = self._ring_buffer[start_pos:start_pos + num_samples]
+        else:
+            # Wrapped: copy tail then head
+            tail_size = self._preroll_max_samples - start_pos
+            result[:tail_size] = self._ring_buffer[start_pos:]
+            result[tail_size:] = self._ring_buffer[:num_samples - tail_size]
+
+        return result
+
+    def drain(self) -> None:
+        """Clear queued audio (but preserve ring buffer for continuity)."""
         self._pending = b""
         while not self._queue.empty():
             try:

@@ -197,6 +197,33 @@ class RealtimeClient:
         except RuntimeError:
             pass
 
+    def reset_conversation(self) -> None:
+        """Reset the conversation by closing and reopening the websocket connection.
+
+        This clears all conversation history and starts a fresh session.
+        Use this after confusion or errors to ensure clean state.
+        """
+        if self._closed:
+            return
+
+        async def _reset() -> None:
+            if self._ws is not None:
+                try:
+                    logging.info("Realtime: resetting conversation (closing websocket)")
+                    await self._ws.close()
+                except Exception as exc:
+                    logging.warning("Realtime: error closing websocket during reset: %s", exc)
+                finally:
+                    self._ws = None
+            # Schedule background reconnect for next use
+            self._schedule_background_connect()
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_reset(), self._loop)
+            future.result(timeout=2.0)
+        except Exception as exc:
+            logging.warning("Realtime: reset_conversation failed: %s", exc)
+
     async def _send_utterance_async(
         self,
         pcm16_audio: np.ndarray,
@@ -246,6 +273,7 @@ class RealtimeClient:
             }
             if "audio" in self._config.modalities:
                 response_payload["response"]["output_audio_format"] = self._output_audio_format
+            logging.info("Realtime: sending response.create with modalities=%s", self._config.modalities)
             await self._ws.send(json.dumps(response_payload))
             logging.debug("Realtime: request sent; awaiting events.")
 
@@ -285,6 +313,7 @@ class RealtimeClient:
         tool_results: List[Dict[str, Any]] = []
         response_id: Optional[str] = None
         audio_chunks_received = 0
+        event_types_seen: set = set()
 
         logger = logging.getLogger(__name__)
 
@@ -299,6 +328,9 @@ class RealtimeClient:
             if event_type is None:
                 continue
 
+            # Track all event types for diagnostics
+            event_types_seen.add(event_type)
+
             # Log ALL events to diagnose why OpenAI isn't responding
             if event_type in {"response.output_audio.delta", "response.audio.delta"}:
                 audio_field = event.get("audio") or event.get("delta") or event.get("chunk")
@@ -311,30 +343,48 @@ class RealtimeClient:
                 logger.info("Realtime event: %s", event_type)
             elif event_type == "error":
                 logger.error("Realtime event: ERROR - %s", event.get("error", {}))
-            elif event_type == "conversation.item.input_audio_transcription.completed":
+            elif event_type in {
+                # User input transcription events (streaming - ignore, we only care about final)
+                "conversation.item.input_audio_transcription.delta",
+                "input_audio_transcription.delta",
+            }:
+                # Partial transcripts - don't log, just track the event
+                logger.debug("Realtime event: %s", event_type)
+            elif event_type in {
+                "conversation.item.input_audio_transcription.completed",
+                "input_audio_transcription.completed",
+            }:
+                # Final user transcript - just log what was said
                 transcript = event.get("transcript", "")
-                logger.info("Realtime: input audio transcribed: '%s'", transcript)
-            elif event_type == "conversation.item.input_audio_transcription.failed":
-                error_msg = event.get("error", {}).get("message", "unknown")
+                if transcript:
+                    logger.info("You said: '%s'", transcript)
+                else:
+                    logger.warning("Transcription completed but no transcript received")
+            elif event_type in {
+                "conversation.item.input_audio_transcription.failed",
+                "input_audio_transcription.failed",
+            }:
+                error_msg = (event.get("error", {}) or {}).get("message", "unknown")
                 logger.error("Realtime: input audio transcription FAILED: %s", error_msg)
+            elif event_type == "conversation.item.created":
+                # Track the event but don't log transcripts here (handled by transcription.completed)
+                logger.debug("Realtime event: %s", event_type)
             else:
                 logger.info("Realtime event: %s", event_type)
 
             if "response_id" in event:
                 response_id = event.get("response_id") or response_id
 
-            if event_type in {"response.output_text.delta", "response.text.delta"}:
-                delta = event.get("delta") or event.get("text")
+            if event_type in {"response.output_text.delta", "response.text.delta", "response.audio_transcript.delta"}:
+                delta = event.get("delta") or event.get("text") or event.get("transcript")
                 text_fragments.extend(self._extract_text(delta))
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("Realtime text delta: %s", delta)
-            elif event_type in {"response.output_text.done", "response.text.done"}:
+                logger.info("Realtime: text delta received (type=%s): '%s'", event_type, delta)
+            elif event_type in {"response.output_text.done", "response.text.done", "response.audio_transcript.done"}:
                 # Skip done events - we've already accumulated all deltas.
                 # The done event contains the full text, not just remaining text,
                 # so accumulating it would duplicate everything.
-                if logger.isEnabledFor(logging.DEBUG):
-                    final_text = event.get("text") or event.get("output")
-                    logger.debug("Realtime text done: %s", final_text)
+                final_text = event.get("text") or event.get("output") or event.get("transcript")
+                logger.info("Realtime: text done (type=%s, skipping, already accumulated from deltas): '%s'", event_type, final_text)
             elif event_type in {"response.output_audio.delta", "response.audio.delta"}:
                 chunks = list(self._extract_audio(event))
                 if chunks:
@@ -379,13 +429,15 @@ class RealtimeClient:
                 tool_results.append(
                     {"tool_call_id": call_id, "name": tool_name, "arguments": arguments, "output": output}
                 )
+                # Send tool result using conversation.item.create (correct event type)
                 payload = {
-                    "type": "response.tool_result",
-                    "tool_call_id": call_id,
-                    "output": json.dumps(output, ensure_ascii=False),
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(output, ensure_ascii=False),
+                    }
                 }
-                if response_id:
-                    payload["response_id"] = response_id
                 await self._ws.send(json.dumps(payload))
             elif event_type in {"response.completed", "response.done"}:
                 break
@@ -396,12 +448,21 @@ class RealtimeClient:
                 logging.debug("Unhandled realtime event: %s", event_type)
 
         final_text = "".join(text_fragments).strip()
-        if audio_chunks_received > 0:
-            logging.info("Realtime: response complete (text_len=%d, audio_chunks=%d, tools=%d)",
-                        len(final_text), audio_chunks_received, len(tool_results))
-        else:
-            logging.warning("Realtime: response complete but NO AUDIO RECEIVED (text_len=%d, tools=%d)",
-                          len(final_text), len(tool_results))
+
+        # Log summary with event types for debugging
+        logging.info(
+            "Realtime: response complete (text_len=%d, audio_chunks=%d, tools=%d, event_types=%s)",
+            len(final_text),
+            audio_chunks_received,
+            len(tool_results),
+            sorted(event_types_seen)
+        )
+
+        if audio_chunks_received == 0:
+            logging.warning("Realtime: NO AUDIO RECEIVED - check modalities configuration")
+        if len(final_text) == 0 and len(tool_results) == 0:
+            logging.warning("Realtime: NO TEXT RECEIVED - API may be sending audio-only responses")
+
         return RealtimeResponse(text=final_text, tool_results=tool_results, response_id=response_id)
 
     def _extract_text(self, payload: Any) -> List[str]:
@@ -452,6 +513,39 @@ class RealtimeClient:
             except Exception:
                 continue
         return chunks
+
+    def _extract_user_transcript(self, payload: Any) -> str:
+        """Extract a user transcript string from a nested payload structure.
+
+        Looks for common fields used by the Realtime API for user inputs, such as
+        content items with type 'input_audio' + 'transcript' or 'input_text' + 'text'.
+        """
+        parts: List[str] = []
+
+        def _visit(node: Any) -> None:
+            if isinstance(node, dict):
+                node_type = node.get("type")
+                # Direct fields
+                if isinstance(node.get("transcript"), str):
+                    parts.append(node["transcript"]) 
+                # Input text items
+                if node_type == "input_text" and isinstance(node.get("text"), str):
+                    parts.append(node["text"]) 
+                # Sometimes 'value' holds text
+                if isinstance(node.get("value"), str) and node_type in {"input_text", "text", None}:
+                    parts.append(node["value"]) 
+                # Recurse into common containers
+                for key in ("content", "items", "values", "data", "delta"):
+                    if key in node:
+                        _visit(node[key])
+            elif isinstance(node, list):
+                for item in node:
+                    _visit(item)
+            # Ignore bare strings here to avoid mixing in assistant text
+
+        if payload is not None:
+            _visit(payload)
+        return " ".join(p for p in parts if p).strip()
 
     async def _recv_event(self) -> str:
         if self._ws is None:
